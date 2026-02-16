@@ -1,4 +1,4 @@
-name = "void-time"
+name = "void-realtime"
 main = "src/index.ts"
 compatibility_date = "2024-12-30"
 
@@ -11,7 +11,7 @@ class_name = "ChatRoom"
 name = "CALL_ROOM"
 class_name = "CallRoom"
 
-# Durable Objects migrations
+# Durable Objects migrations (free plan uses sqlite classes)
 [[migrations]]
 tag = "v1"
-new_classes = ["ChatRoom", "CallRoom"]
+new_sqlite_classes = ["ChatRoom", "CallRoom"]
