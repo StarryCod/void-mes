@@ -8,7 +8,7 @@ import { useChatStore, Contact, Channel, Message } from '@/store/chat';
 import { AuthForm } from '@/components/auth/AuthForm';
 import { VoidLogo } from '@/components/common/VoidLogo';
 import { CallManager } from '@/components/call/CallManager';
-import { useSocket } from '@/hooks/useSocket';
+import { useWebSocket } from '@/hooks/useWebSocket';
 import { useAppwriteRealtime } from '@/hooks/useAppwriteRealtime';
 import { useToast } from '@/hooks/use-toast';
 import {
@@ -29,18 +29,18 @@ export function MessengerApp() {
   } = useChatStore();
   const { toast } = useToast();
   const { 
-    sendMessage: socketSendMessage, 
+    sendMessage: wsSendMessage, 
     sendTyping, 
     markAsRead, 
     notifyContactAdded,
     callUser,
     answerCall,
     rejectCall,
-    endCall: socketEndCall,
+    endCall: wsEndCall,
     sendIceCandidate,
     notifyScreenShareStart,
     notifyScreenShareStop
-  } = useSocket();
+  } = useWebSocket();
 
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   
@@ -146,7 +146,7 @@ export function MessengerApp() {
 
     const handleSocketEnd = (e: CustomEvent) => {
       const { targetId } = e.detail;
-      socketEndCall(targetId);
+      wsEndCall(targetId);
     };
 
     const handleSocketIce = (e: CustomEvent) => {
@@ -181,7 +181,7 @@ export function MessengerApp() {
       window.removeEventListener('void-socket-screen-start', handleSocketScreenStart as EventListener);
       window.removeEventListener('void-socket-screen-stop', handleSocketScreenStop as EventListener);
     };
-  }, [user, callUser, answerCall, rejectCall, socketEndCall, sendIceCandidate, notifyScreenShareStart, notifyScreenShareStop]);
+  }, [user, callUser, answerCall, rejectCall, wsEndCall, sendIceCandidate, notifyScreenShareStart, notifyScreenShareStop]);
 
   const checkAuth = useCallback(async () => {
     if (!token) {
@@ -508,7 +508,7 @@ export function MessengerApp() {
         setMessages([...current.filter((m: Message) => m.id !== tempId), data.message]);
         
         // Send via socket for real-time delivery
-        socketSendMessage(activeChat?.id, activeChannel?.id, data.message);
+        wsSendMessage(activeChat?.id, activeChannel?.id, data.message);
       }
     } catch (e) {
       console.error('Send error:', e);
@@ -622,7 +622,7 @@ export function MessengerApp() {
           addMessage(data.message);
           
           // Send via socket for real-time delivery
-          socketSendMessage(activeChat?.id, activeChannel?.id, data.message);
+          wsSendMessage(activeChat?.id, activeChannel?.id, data.message);
         }
       } catch (e) {
         console.error('Voice send error:', e);
@@ -1207,7 +1207,7 @@ export function MessengerApp() {
 
         {/* Input */}
         {activeTarget && (
-          <div className="p-4 bg-[#1a1a24] border-t border-white/5">
+          <div className="p-4 bg-[#1a1a24] border-t border-white/5 pb-20 md:pb-4">
             {isRecording ? (
               <div className="flex items-center gap-3 bg-[#242430] rounded-xl px-4 py-3">
                 <motion.div animate={{ scale: [1, 1.2, 1] }} transition={{ duration: 1, repeat: Infinity }} className="w-3 h-3 bg-red-500 rounded-full" />
