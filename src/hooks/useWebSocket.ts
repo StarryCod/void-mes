@@ -9,8 +9,13 @@ let globalWs: WebSocket | null = null;
 let globalUserId: string | null = null;
 let reconnectTimeout: NodeJS.Timeout | null = null;
 
-// Cloudflare Workers URL (will be set via env or fallback)
-const CF_WORKERS_URL = process.env.NEXT_PUBLIC_CF_WORKERS_URL || 'https://void-time.starrycod.workers.dev';
+// Cloudflare Workers URL - must use wss:// for secure WebSocket
+const getWebSocketUrl = (userId: string) => {
+  const baseUrl = process.env.NEXT_PUBLIC_CF_WORKERS_URL || 'https://void-time.starrycod.workers.dev';
+  // Convert https:// to wss:// for WebSocket
+  const wsUrl = baseUrl.replace(/^https?:\/\//, 'wss://');
+  return `${wsUrl}/ws/user/${userId}`;
+};
 
 export function useWebSocket() {
   const user = useAuthStore((state) => state.user);
@@ -145,7 +150,7 @@ export function useWebSocket() {
     globalUserId = userId;
     
     // Connect to Cloudflare Workers WebSocket
-    const wsUrl = `${CF_WORKERS_URL}/ws/user/${userId}`;
+    const wsUrl = getWebSocketUrl(userId);
     
     console.log('[WebSocket] Connecting to:', wsUrl);
     
@@ -250,14 +255,37 @@ export function useWebSocket() {
   }, []);
 
   // ==================== CALL FUNCTIONS ====================
+  // Calls use separate CallRoom Durable Object for better reliability
 
-  const callUser = useCallback((targetId: string, signal: any, callType: 'voice' | 'video', callerName: string) => {
+  const callUser = useCallback(async (targetId: string, signal: any, callType: 'voice' | 'video', callerName: string) => {
+    // Check connection first
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      // Try to wait for connection
+      console.log('[WebSocket] Waiting for connection before call...');
+      await new Promise<void>((resolve) => {
+        const checkInterval = setInterval(() => {
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            clearInterval(checkInterval);
+            resolve();
+          }
+        }, 100);
+        // Timeout after 5 seconds
+        setTimeout(() => {
+          clearInterval(checkInterval);
+          resolve();
+        }, 5000);
+      });
+    }
+
+    // Check again after waiting
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
       window.dispatchEvent(new CustomEvent('void-call-error', {
-        detail: { message: 'Нет соединения с сервером' }
+        detail: { message: 'Нет соединения с сервером. Проверьте интернет.' }
       }));
       return;
     }
+    
+    const callId = `call-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
     wsRef.current.send(JSON.stringify({
       type: 'call',
@@ -265,7 +293,8 @@ export function useWebSocket() {
       targetId,
       callType,
       signal,
-      callerName
+      callerName,
+      callId
     }));
   }, []);
 
