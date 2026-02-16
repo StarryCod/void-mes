@@ -1,186 +1,150 @@
-import { DurableObject, DurableObjectState, Request } from '@cloudflare/workers-types';
-import { Env, Message, getDb, corsHeaders } from './types';
+import { DurableObject } from 'cloudflare:workers';
 
-interface WebSocketWithMetadata {
-  websocket: WebSocket;
+interface Env {
+  DATABASE_URL: string;
+}
+
+interface WebSocketData {
   userId: string;
   joinedAt: number;
 }
 
-interface ChatMessage {
-  type: 'message' | 'typing' | 'read' | 'presence' | 'contact' | 'call';
-  action: string;
-  data: any;
-  senderId?: string;
-  timestamp?: number;
-}
-
-// ChatRoom Durable Object - handles WebSocket connections for a specific room
+// ChatRoom Durable Object
 export class ChatRoom extends DurableObject {
-  private state: DurableObjectState;
-  private env: Env;
-  private sessions: Map<WebSocket, WebSocketWithMetadata> = new Map();
-  private lastActivity: number = Date.now();
-
+  private sessions: Map<WebSocket, WebSocketData> = new Map();
+  
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    this.state = state;
-    this.env = env;
   }
-
+  
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     
     // Handle WebSocket upgrade
     if (request.headers.get('Upgrade') === 'websocket') {
-      return this.handleWebSocket(request);
+      return this.handleWebSocket(request, url);
     }
     
     // Handle HTTP requests for room state
     if (url.pathname === '/users') {
-      const users = Array.from(this.sessions.values()).map(s => ({
-        userId: s.userId,
-        joinedAt: s.joinedAt,
-      }));
+      const users: Array<{ userId: string; joinedAt: number }> = [];
+      this.sessions.forEach(function(data) {
+        users.push({ userId: data.userId, joinedAt: data.joinedAt });
+      });
       return new Response(JSON.stringify(users), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        }
       });
     }
     
     if (url.pathname === '/broadcast' && request.method === 'POST') {
-      const body = await request.json() as ChatMessage;
+      const body = await request.json();
       await this.broadcast(body);
       return new Response(JSON.stringify({ success: true }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+        headers: { 'Content-Type': 'application/json' }
       });
     }
     
     return new Response('Not Found', { status: 404 });
   }
-
-  async handleWebSocket(request: Request): Promise<Response> {
-    const url = new URL(request.url);
+  
+  async handleWebSocket(request: Request, url: URL): Promise<Response> {
     const userId = url.searchParams.get('userId');
     
     if (!userId) {
       return new Response('Missing userId', { status: 400 });
     }
-
+    
     const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+    const client = pair[0];
+    const server = pair[1];
     
     server.accept();
     
-    const metadata: WebSocketWithMetadata = {
-      websocket: server,
-      userId,
-      joinedAt: Date.now(),
+    const data: WebSocketData = {
+      userId: userId,
+      joinedAt: Date.now()
     };
     
-    this.sessions.set(server, metadata);
-    this.lastActivity = Date.now();
+    this.sessions.set(server, data);
     
     // Notify others that user joined
     await this.broadcast({
       type: 'presence',
       action: 'online',
-      data: { userId },
-      timestamp: Date.now(),
+      data: { userId: userId },
+      timestamp: Date.now()
     }, server);
     
-    server.addEventListener('message', async (event) => {
+    const self = this;
+    
+    server.addEventListener('message', function(event) {
       try {
-        const msg = JSON.parse(event.data as string) as ChatMessage;
+        const msg = JSON.parse(event.data as string);
         msg.senderId = userId;
         msg.timestamp = Date.now();
-        
-        await this.handleMessage(server, msg);
+        self.handleMessage(server, msg);
       } catch (e) {
         console.error('Failed to parse message:', e);
       }
     });
     
-    server.addEventListener('close', async () => {
-      this.sessions.delete(server);
-      
-      // Notify others that user left
-      await this.broadcast({
+    server.addEventListener('close', function() {
+      self.sessions.delete(server);
+      self.broadcast({
         type: 'presence',
         action: 'offline',
-        data: { userId },
-        timestamp: Date.now(),
+        data: { userId: userId },
+        timestamp: Date.now()
       });
     });
     
-    server.addEventListener('error', (e) => {
+    server.addEventListener('error', function(e) {
       console.error('WebSocket error:', e);
-      this.sessions.delete(server);
+      self.sessions.delete(server);
     });
     
     return new Response(null, {
       status: 101,
-      webSocket: client,
+      webSocket: client
     });
   }
-
-  async handleMessage(sender: WebSocket, msg: ChatMessage): Promise<void> {
-    this.lastActivity = Date.now();
-    
+  
+  handleMessage(sender: WebSocket, msg: any): void {
     switch (msg.type) {
       case 'message':
-        // Broadcast message to all in room
-        await this.broadcast(msg);
-        break;
-        
       case 'typing':
-        // Broadcast typing indicator
-        await this.broadcast(msg, sender);
-        break;
-        
       case 'read':
-        // Mark messages as read
-        await this.broadcast(msg, sender);
-        break;
-        
       case 'contact':
-        // Contact request notification
-        await this.broadcast(msg, sender);
-        break;
-        
       case 'call':
-        // Call signaling
-        await this.broadcast(msg, sender);
+        this.broadcast(msg, sender);
         break;
-        
       default:
         console.log('Unknown message type:', msg.type);
     }
   }
-
-  async broadcast(message: ChatMessage, exclude?: WebSocket): Promise<void> {
+  
+  async broadcast(message: any, exclude?: WebSocket): Promise<void> {
     const messageStr = JSON.stringify(message);
     
-    for (const [ws] of this.sessions) {
+    this.sessions.forEach(function(ws) {
       if (ws !== exclude && ws.readyState === WebSocket.OPEN) {
         ws.send(messageStr);
       }
-    }
+    });
   }
 }
 
-// CallRoom Durable Object - handles WebRTC signaling
+// CallRoom Durable Object
 export class CallRoom extends DurableObject {
-  private state: DurableObjectState;
-  private env: Env;
   private participants: Map<string, WebSocket> = new Map();
-  private callState: 'idle' | 'ringing' | 'connected' = 'idle';
-
+  
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    this.state = state;
-    this.env = env;
   }
-
+  
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get('Upgrade') === 'websocket') {
       return this.handleWebSocket(request);
@@ -188,79 +152,70 @@ export class CallRoom extends DurableObject {
     
     return new Response('Not Found', { status: 404 });
   }
-
+  
   async handleWebSocket(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const userId = url.searchParams.get('userId');
-    const callId = url.searchParams.get('callId');
+    const userId = url.searchParams.get('userId') || '';
     
-    if (!userId) {
-      return new Response('Missing userId', { status: 400 });
-    }
-
     const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+    const client = pair[0];
+    const server = pair[1];
     
     server.accept();
     this.participants.set(userId, server);
     
-    server.addEventListener('message', async (event) => {
+    const self = this;
+    
+    server.addEventListener('message', function(event) {
       try {
         const msg = JSON.parse(event.data as string);
         msg.senderId = userId;
         
-        // Handle WebRTC signaling
         switch (msg.type) {
           case 'offer':
           case 'answer':
           case 'ice-candidate':
-            // Forward to specific target
-            const targetWs = this.participants.get(msg.targetId);
+            const targetWs = self.participants.get(msg.targetId);
             if (targetWs && targetWs.readyState === WebSocket.OPEN) {
               targetWs.send(JSON.stringify(msg));
             }
             break;
             
           case 'call-start':
-            this.callState = 'ringing';
-            // Notify other participants
-            for (const [id, ws] of this.participants) {
+            self.participants.forEach(function(ws, id) {
               if (id !== userId && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                   type: 'incoming-call',
                   callerId: userId,
-                  callId,
+                  callId: msg.callId,
                   callType: msg.callType,
-                  signal: msg.signal,
+                  signal: msg.signal
                 }));
               }
-            }
+            });
             break;
             
           case 'call-answer':
-            this.callState = 'connected';
-            const callerWs = this.participants.get(msg.targetId);
+            const callerWs = self.participants.get(msg.targetId);
             if (callerWs && callerWs.readyState === WebSocket.OPEN) {
               callerWs.send(JSON.stringify({
                 type: 'call-answered',
                 answererId: userId,
-                signal: msg.signal,
+                signal: msg.signal
               }));
             }
             break;
             
           case 'call-reject':
           case 'call-end':
-            this.callState = 'idle';
-            // Notify all participants
-            for (const [id, ws] of this.participants) {
+            self.participants.forEach(function(ws, id) {
               if (id !== userId && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
                   type: msg.type === 'call-reject' ? 'call-rejected' : 'call-ended',
-                  senderId: userId,
+                  senderId: userId
                 }));
               }
-            }
+            });
             break;
         }
       } catch (e) {
@@ -268,23 +223,22 @@ export class CallRoom extends DurableObject {
       }
     });
     
-    server.addEventListener('close', () => {
-      this.participants.delete(userId);
+    server.addEventListener('close', function() {
+      self.participants.delete(userId);
       
-      // Notify others that participant left
-      for (const [id, ws] of this.participants) {
+      self.participants.forEach(function(ws, id) {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
             type: 'call-ended',
-            senderId: userId,
+            senderId: userId
           }));
         }
-      }
+      });
     });
     
     return new Response(null, {
       status: 101,
-      webSocket: client,
+      webSocket: client
     });
   }
 }
