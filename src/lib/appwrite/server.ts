@@ -2,10 +2,17 @@ import { Client, Databases, Users, Account, Storage, ID, Query } from 'node-appw
 
 // Server-side Appwrite client with API key (full permissions)
 export function createAppwriteClient() {
+  const endpoint = process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT || 'https://fra.cloud.appwrite.io/v1';
+  const projectId = process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID || '69923291001c25654226';
+  const apiKey = process.env.APPWRITE_API_KEY || '';
+  
   const client = new Client()
-    .setEndpoint(process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT!)
-    .setProject(process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID!)
-    .setKey(process.env.APPWRITE_API_KEY!);
+    .setEndpoint(endpoint)
+    .setProject(projectId);
+  
+  if (apiKey) {
+    client.setKey(apiKey);
+  }
 
   return {
     client,

@@ -2,9 +2,12 @@ import { Client, Account, Databases, Storage, ID, Query } from 'appwrite';
 
 // Browser-side Appwrite client (limited permissions, uses sessions)
 export function createBrowserAppwriteClient() {
+  const endpoint = process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT || 'https://fra.cloud.appwrite.io/v1';
+  const projectId = process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID || '69923291001c25654226';
+  
   const client = new Client()
-    .setEndpoint(process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT!)
-    .setProject(process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID!);
+    .setEndpoint(endpoint)
+    .setProject(projectId);
 
   return {
     client,
