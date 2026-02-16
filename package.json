@@ -89,18 +89,22 @@
     "vaul": "^1.1.2",
     "z-ai-web-dev-sdk": "^0.0.16",
     "zod": "^4.0.2",
-    "zustand": "^5.0.6"
+    "zustand": "^5.0.6",
+    "hono": "^4.6.14",
+    "@neondatabase/serverless": "^0.10.4"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/bcrypt": "^6.0.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@cloudflare/workers-types": "^4.20241230.0",
     "bun-types": "^1.3.4",
     "eslint": "^9",
     "eslint-config-next": "^16.1.1",
     "tailwindcss": "^4",
     "tw-animate-css": "^1.3.5",
-    "typescript": "^5"
+    "typescript": "^5",
+    "wrangler": "^3.99.0"
   }
 }
