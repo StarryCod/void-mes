@@ -1,10 +1,64 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { Env, getDb, verifyUser, jsonResponse, errorResponse, handleCors, corsHeaders } from './types';
-import { ChatRoom, CallRoom } from './durable-objects';
+import { neon } from '@neondatabase/serverless';
+
+// Types
+interface Env {
+  DATABASE_URL: string;
+  APPWRITE_ENDPOINT: string;
+  APPWRITE_PROJECT_ID: string;
+  APPWRITE_API_KEY: string;
+  CHAT_ROOM: DurableObjectNamespace;
+  CALL_ROOM: DurableObjectNamespace;
+}
 
 // Export Durable Objects
-export { ChatRoom, CallRoom };
+export { ChatRoom } from './durable-objects';
+export { CallRoom } from './durable-objects';
+
+// Helpers
+function jsonResponse(data: any, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    },
+  });
+}
+
+function errorResponse(message: string, status = 400): Response {
+  return jsonResponse({ error: message }, status);
+}
+
+async function verifyUser(request: Request, env: Env): Promise<string | null> {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return null;
+  }
+  
+  const token = authHeader.slice(7);
+  const sql = neon(env.DATABASE_URL);
+  
+  const sessions = await sql`
+    SELECT s."userId", s."expiresAt" 
+    FROM "Session" s 
+    WHERE s.token = ${token}
+  `;
+  
+  if (sessions.length === 0) {
+    return null;
+  }
+  
+  const session = sessions[0];
+  if (new Date(session.expiresAt) < new Date()) {
+    return null;
+  }
+  
+  return session.userId;
+}
 
 // Create Hono app
 const app = new Hono<{ Bindings: Env }>();
@@ -16,16 +70,23 @@ app.use('*', cors({
   allowHeaders: ['Content-Type', 'Authorization'],
 }));
 
-// ==================== AUTH ====================
+// Health check
+app.get('/', function(c) {
+  return c.json({ 
+    status: 'ok', 
+    service: 'void-realtime',
+    version: '1.0.0'
+  });
+});
 
-// Verify token and get user
-app.get('/api/auth/me', async (c) => {
+// ==================== AUTH ====================
+app.get('/api/auth/me', async function(c) {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
     return errorResponse('Unauthorized', 401);
   }
   
-  const sql = getDb(c.env);
+  const sql = neon(c.env.DATABASE_URL);
   const users = await sql`
     SELECT id, username, "displayName", avatar, bio, status, "isOnline", "lastSeen"
     FROM "User" WHERE id = ${userId}
@@ -35,7 +96,6 @@ app.get('/api/auth/me', async (c) => {
     return errorResponse('User not found', 404);
   }
   
-  // Update online status
   await sql`
     UPDATE "User" SET "isOnline" = true, "lastSeen" = NOW()
     WHERE id = ${userId}
@@ -45,15 +105,13 @@ app.get('/api/auth/me', async (c) => {
 });
 
 // ==================== CONTACTS ====================
-
-// Get contacts
-app.get('/api/contacts', async (c) => {
+app.get('/api/contacts', async function(c) {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
     return errorResponse('Unauthorized', 401);
   }
   
-  const sql = getDb(c.env);
+  const sql = neon(c.env.DATABASE_URL);
   const contacts = await sql`
     SELECT 
       u.id, u.username, u."displayName", u.avatar, u.bio, u.status, 
@@ -67,22 +125,21 @@ app.get('/api/contacts', async (c) => {
   return jsonResponse(contacts);
 });
 
-// Add contact
-app.post('/api/contacts', async (c) => {
+app.post('/api/contacts', async function(c) {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
     return errorResponse('Unauthorized', 401);
   }
   
-  const { contactId } = await c.req.json();
+  const body = await c.req.json();
+  const contactId = body.contactId;
   
   if (!contactId) {
     return errorResponse('contactId required');
   }
   
-  const sql = getDb(c.env);
+  const sql = neon(c.env.DATABASE_URL);
   
-  // Check if already contacts
   const existing = await sql`
     SELECT id FROM "Contact" 
     WHERE "userId" = ${userId} AND "contactId" = ${contactId}
@@ -92,7 +149,6 @@ app.post('/api/contacts', async (c) => {
     return errorResponse('Already in contacts');
   }
   
-  // Add both ways (mutual contacts)
   await sql`
     INSERT INTO "Contact" ("id", "userId", "contactId", "createdAt")
     VALUES (gen_random_uuid(), ${userId}, ${contactId}, NOW())
@@ -103,34 +159,16 @@ app.post('/api/contacts', async (c) => {
     VALUES (gen_random_uuid(), ${contactId}, ${userId}, NOW())
   `;
   
-  // Get contact info
   const contactInfo = await sql`
     SELECT id, username, "displayName", avatar, bio, status, "isOnline", "lastSeen"
     FROM "User" WHERE id = ${contactId}
   `;
   
-  // Notify via WebSocket
-  const roomId = `user-${contactId}`;
-  const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-  await room.fetch(new Request('https://internal/broadcast', {
-    method: 'POST',
-    body: JSON.stringify({
-      type: 'contact',
-      action: 'new',
-      data: {
-        id: userId,
-        ...contactInfo[0],
-      },
-    }),
-  }));
-  
   return jsonResponse({ success: true, contact: contactInfo[0] });
 });
 
 // ==================== MESSAGES ====================
-
-// Get messages
-app.get('/api/messages', async (c) => {
+app.get('/api/messages', async function(c) {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
     return errorResponse('Unauthorized', 401);
@@ -139,7 +177,7 @@ app.get('/api/messages', async (c) => {
   const contactId = c.req.query('contactId');
   const channelId = c.req.query('channelId');
   
-  const sql = getDb(c.env);
+  const sql = neon(c.env.DATABASE_URL);
   
   let messages;
   if (contactId) {
@@ -170,22 +208,27 @@ app.get('/api/messages', async (c) => {
   return jsonResponse(messages);
 });
 
-// Send message
-app.post('/api/messages', async (c) => {
+app.post('/api/messages', async function(c) {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
     return errorResponse('Unauthorized', 401);
   }
   
-  const { receiverId, channelId, content, isVoice, voiceUrl, voiceDuration } = await c.req.json();
+  const body = await c.req.json();
+  const receiverId = body.receiverId;
+  const channelId = body.channelId;
+  const content = body.content;
+  const isVoice = body.isVoice;
+  const voiceUrl = body.voiceUrl;
+  const voiceDuration = body.voiceDuration;
   
   if (!content && !voiceUrl) {
     return errorResponse('content or voiceUrl required');
   }
   
-  const sql = getDb(c.env);
+  const sql = neon(c.env.DATABASE_URL);
   
-  const [message] = await sql`
+  const result = await sql`
     INSERT INTO "Message" (
       id, content, "senderId", "receiverId", "channelId", 
       "isVoice", "voiceUrl", "voiceDuration", "createdAt"
@@ -197,53 +240,25 @@ app.post('/api/messages', async (c) => {
     RETURNING *
   `;
   
-  // Get sender info
-  const [sender] = await sql`
+  const message = result[0];
+  
+  const senderResult = await sql`
     SELECT id, username, "displayName", avatar FROM "User" WHERE id = ${userId}
   `;
   
-  const fullMessage = { ...message, sender };
-  
-  // Notify via WebSocket
-  if (receiverId) {
-    // Direct message - notify receiver
-    const roomId = `user-${receiverId}`;
-    const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-    await room.fetch(new Request('https://internal/broadcast', {
-      method: 'POST',
-      body: JSON.stringify({
-        type: 'message',
-        action: 'new',
-        data: fullMessage,
-      }),
-    }));
-  } else if (channelId) {
-    // Channel message - notify all in channel
-    const roomId = `channel-${channelId}`;
-    const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-    await room.fetch(new Request('https://internal/broadcast', {
-      method: 'POST',
-      body: JSON.stringify({
-        type: 'message',
-        action: 'new',
-        data: fullMessage,
-      }),
-    }));
-  }
+  const fullMessage = { ...message, sender: senderResult[0] };
   
   return jsonResponse(fullMessage);
-}
+});
 
 // ==================== CHANNELS ====================
-
-// Get channels
-app.get('/api/channels', async (c) => {
+app.get('/api/channels', async function(c) {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
     return errorResponse('Unauthorized', 401);
   }
   
-  const sql = getDb(c.env);
+  const sql = neon(c.env.DATABASE_URL);
   const channels = await sql`
     SELECT c.*, cm.role
     FROM "Channel" c
@@ -255,28 +270,31 @@ app.get('/api/channels', async (c) => {
   return jsonResponse(channels);
 });
 
-// Create channel
-app.post('/api/channels', async (c) => {
+app.post('/api/channels', async function(c) {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
     return errorResponse('Unauthorized', 401);
   }
   
-  const { name, description, isPrivate } = await c.req.json();
+  const body = await c.req.json();
+  const name = body.name;
+  const description = body.description;
+  const isPrivate = body.isPrivate;
   
   if (!name) {
     return errorResponse('name required');
   }
   
-  const sql = getDb(c.env);
+  const sql = neon(c.env.DATABASE_URL);
   
-  const [channel] = await sql`
+  const result = await sql`
     INSERT INTO "Channel" (id, name, description, "isPrivate", "createdAt")
     VALUES (gen_random_uuid(), ${name}, ${description || null}, ${isPrivate || false}, NOW())
     RETURNING *
   `;
   
-  // Add creator as admin
+  const channel = result[0];
+  
   await sql`
     INSERT INTO "ChannelMember" (id, "channelId", "userId", role, "joinedAt")
     VALUES (gen_random_uuid(), ${channel.id}, ${userId}, 'admin', NOW())
@@ -286,25 +304,24 @@ app.post('/api/channels', async (c) => {
 });
 
 // ==================== USERS ====================
-
-// Search users
-app.get('/api/users/search', async (c) => {
+app.get('/api/users/search', async function(c) {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
     return errorResponse('Unauthorized', 401);
   }
   
-  const q = c.req.query('q')?.trim().toLowerCase();
-  
+  const q = c.req.query('q');
   if (!q || q.length < 1) {
     return jsonResponse([]);
   }
   
-  const sql = getDb(c.env);
+  const searchQuery = q.trim().toLowerCase();
+  
+  const sql = neon(c.env.DATABASE_URL);
   const users = await sql`
     SELECT id, username, "displayName", avatar, bio, status
     FROM "User"
-    WHERE (LOWER(username) LIKE ${'%' + q + '%'} OR LOWER("displayName") LIKE ${'%' + q + '%'})
+    WHERE (LOWER(username) LIKE ${'%' + searchQuery + '%'} OR LOWER("displayName") LIKE ${'%' + searchQuery + '%'})
       AND id != ${userId}
     LIMIT 10
   `;
@@ -313,63 +330,37 @@ app.get('/api/users/search', async (c) => {
 });
 
 // ==================== WEBSOCKET ====================
-
-// WebSocket endpoint for user events
-app.get('/ws/user/:userId', async (c) => {
+app.get('/ws/user/:userId', async function(c) {
   const userId = c.req.param('userId');
-  const roomId = `user-${userId}`;
+  const roomId = 'user-' + userId;
   
-  const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
+  const id = c.env.CHAT_ROOM.idFromName(roomId);
+  const room = c.env.CHAT_ROOM.get(id);
   return room.fetch(c.req.raw);
 });
 
-// WebSocket endpoint for channel events
-app.get('/ws/channel/:channelId', async (c) => {
+app.get('/ws/channel/:channelId', async function(c) {
   const channelId = c.req.param('channelId');
-  const roomId = `channel-${channelId}`;
+  const roomId = 'channel-' + channelId;
   
-  const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
+  const id = c.env.CHAT_ROOM.idFromName(roomId);
+  const room = c.env.CHAT_ROOM.get(id);
   return room.fetch(c.req.raw);
 });
 
-// WebSocket endpoint for calls
-app.get('/ws/call/:callId', async (c) => {
+app.get('/ws/call/:callId', async function(c) {
   const callId = c.req.param('callId');
   const userId = c.req.query('userId');
   
-  const room = c.env.CALL_ROOM.get(c.env.CALL_ROOM.idFromName(callId));
+  const id = c.env.CALL_ROOM.idFromName(callId);
+  const room = c.env.CALL_ROOM.get(id);
   
-  // Add userId to query params
   const url = new URL(c.req.url);
   url.searchParams.set('userId', userId || '');
   url.searchParams.set('callId', callId);
   
   const modifiedRequest = new Request(url.toString(), c.req.raw);
   return room.fetch(modifiedRequest);
-});
-
-// ==================== HEALTH ====================
-
-app.get('/', (c) => {
-  return c.json({ 
-    status: 'ok', 
-    service: 'void-realtime',
-    version: '1.0.0',
-    endpoints: {
-      websocket: {
-        user: '/ws/user/:userId',
-        channel: '/ws/channel/:channelId',
-        call: '/ws/call/:callId',
-      },
-      api: {
-        auth: '/api/auth/me',
-        contacts: '/api/contacts',
-        messages: '/api/messages',
-        channels: '/api/channels',
-        users: '/api/users/search',
-      }
-    }
-  });
 });
 
 // Export handler
