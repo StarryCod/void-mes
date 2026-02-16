@@ -1,240 +1,206 @@
 'use client';
 
-import { useEffect, useRef, useCallback } from 'react';
-import { io, Socket } from 'socket.io-client';
+import { useEffect, useRef, useCallback, useState } from 'react';
 import { useAuthStore } from '@/store/auth';
 import { useChatStore } from '@/store/chat';
 
-// Global socket instance to prevent multiple connections
-let globalSocket: Socket | null = null;
+// Global WebSocket instance
+let globalWs: WebSocket | null = null;
 let globalUserId: string | null = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
 
 export function useSocket() {
   const user = useAuthStore((state) => state.user);
-  const socketRef = useRef<Socket | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const heartbeatRef = useRef<NodeJS.Timeout | null>(null);
-  const reconnectAttemptsRef = useRef(0);
-  const maxReconnectAttempts = 10;
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
 
-  // Single socket connection effect
+  const getWorkersUrl = useCallback(() => {
+    return process.env.NEXT_PUBLIC_WORKERS_URL || 'https://void-time.mr-starred09.workers.dev';
+  }, []);
+
+  // Connect WebSocket
   useEffect(() => {
     const userId = user?.id;
     
-    // Skip if no user
     if (!userId) {
-      // Disconnect if logged out
-      if (globalSocket) {
-        console.log('[Socket] User logged out, disconnecting');
-        globalSocket.disconnect();
-        globalSocket = null;
+      if (globalWs) {
+        globalWs.close();
+        globalWs = null;
         globalUserId = null;
       }
       return;
     }
-
-    // Already connected as same user
-    if (globalUserId === userId && globalSocket?.connected) {
-      socketRef.current = globalSocket;
-      console.log('[Socket] Reusing existing connection');
+    
+    if (globalUserId === userId && globalWs?.readyState === WebSocket.OPEN) {
+      wsRef.current = globalWs;
+      setIsConnected(true);
       return;
     }
-
-    // Disconnect existing socket if different user
-    if (globalSocket) {
-      console.log('[Socket] Different user, reconnecting');
-      globalSocket.disconnect();
-      globalSocket = null;
+    
+    if (globalWs) {
+      globalWs.close();
     }
-
-    console.log('[Socket] Creating new connection for user:', userId);
+    
     globalUserId = userId;
-
-    const socket = io('/?XTransformPort=3005', {
-      transports: ['websocket', 'polling'],
-      reconnection: true,
-      reconnectionAttempts: 20,
-      reconnectionDelay: 500,
-      reconnectionDelayMax: 3000,
-      timeout: 15000,
-      forceNew: true,
-    });
-
-    globalSocket = socket;
-    socketRef.current = socket;
-
-    // Connection successful
-    socket.on('connect', () => {
-      console.log('[Socket] ✅ Connected:', socket.id);
-      reconnectAttemptsRef.current = 0;
-      socket.emit('register', userId);
+    const wsUrl = `${getWorkersUrl()}/ws/user/${userId}`;
+    console.log('[WS] Connecting to:', wsUrl);
+    
+    const ws = new WebSocket(wsUrl);
+    globalWs = ws;
+    wsRef.current = ws;
+    
+    ws.onopen = () => {
+      console.log('[WS] ✅ Connected');
+      setIsConnected(true);
+      reconnectAttempts = 0;
       
-      // Start heartbeat
       if (heartbeatRef.current) clearInterval(heartbeatRef.current);
       heartbeatRef.current = setInterval(() => {
-        if (socket.connected) {
-          socket.emit('ping');
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'ping' }));
         }
-      }, 15000);
-    });
-
-    socket.on('disconnect', (reason) => {
-      console.log('[Socket] ⚠️ Disconnected:', reason);
-      if (heartbeatRef.current) {
-        clearInterval(heartbeatRef.current);
-        heartbeatRef.current = null;
-      }
-      
-      // If server initiated disconnect, try to reconnect
-      if (reason === 'io server disconnect') {
-        socket.connect();
-      }
-    });
-
-    socket.on('connect_error', (error) => {
-      reconnectAttemptsRef.current++;
-      console.log('[Socket] ❌ Connection error (attempt', reconnectAttemptsRef.current, '):', error.message);
-      
-      if (reconnectAttemptsRef.current >= maxReconnectAttempts) {
-        console.log('[Socket] Max reconnect attempts reached');
-      }
-    });
-
-    socket.on('registered', (data) => {
-      console.log('[Socket] ✅ Registered:', data.userId);
-    });
-
-    socket.on('pong', () => {
-      // Heartbeat response - connection is alive
-    });
-
-    // Message handlers
-    socket.on('new-message', (message) => {
-      const currentChat = useChatStore.getState().activeChat;
-      if (currentChat && message.senderId === currentChat.id) {
-        useChatStore.getState().addMessage(message);
-      }
-      
-      const contacts = useChatStore.getState().contacts;
-      const existingContact = contacts.find(c => c.id === message.senderId);
-      if (existingContact) {
-        useChatStore.getState().setContacts(contacts.map(c => 
-          c.id === message.senderId 
-            ? { ...c, lastMessage: message, unreadCount: (c.unreadCount || 0) + 1 }
-            : c
-        ));
-      }
-
-      if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
-        new Notification('Новое сообщение', { body: message.content || 'Голосовое сообщение' });
-      }
-    });
-
-    socket.on('channel-message', (data) => {
-      const currentChannel = useChatStore.getState().activeChannel;
-      if (currentChannel && data.channelId === currentChannel.id) {
-        useChatStore.getState().addMessage(data.message);
-      }
-    });
-
-    socket.on('new-contact', (contactData) => {
-      const contacts = useChatStore.getState().contacts;
-      if (!contacts.find(c => c.id === contactData.id)) {
-        useChatStore.getState().addContact({
-          id: contactData.id,
-          username: contactData.username || 'Unknown',
-          displayName: contactData.displayName || null,
-          avatar: contactData.avatar || null,
-          bio: contactData.bio || null,
-          status: contactData.status || null,
-          isOnline: true,
-          lastSeen: null,
-          unreadCount: 0,
-          lastMessage: null
-        });
-      }
-    });
-
-    socket.on('user-typing', (data) => {
-      useChatStore.getState().setTypingUser(data.userId, '', data.isTyping);
-    });
-
-    socket.on('user-online', (data) => {
-      const contacts = useChatStore.getState().contacts;
-      useChatStore.getState().setContacts(contacts.map(c => 
-        c.id === data.userId ? { ...c, isOnline: true } : c
-      ));
-    });
-
-    socket.on('user-offline', (data) => {
-      const contacts = useChatStore.getState().contacts;
-      useChatStore.getState().setContacts(contacts.map(c => 
-        c.id === data.userId ? { ...c, isOnline: false, lastSeen: new Date().toISOString() } : c
-      ));
-    });
-
-    // Call events
-    socket.on('incoming-call', (data) => {
-      console.log('[Socket] 📞 Incoming call from:', data.callerId);
-      window.dispatchEvent(new CustomEvent('void-incoming-call', { detail: data }));
-      if ('Notification' in window && Notification.permission === 'granted') {
-        new Notification(`${data.callType === 'video' ? '📹' : '📞'} Входящий звонок`, {
-          body: `Звонит ${data.callerName}`,
-          requireInteraction: true
-        });
-      }
-    });
-
-    socket.on('call-answered', (data) => {
-      console.log('[Socket] 📞 Call answered by:', data.answererId);
-      window.dispatchEvent(new CustomEvent('void-call-answered', { detail: data }));
-    });
-
-    socket.on('call-rejected', (data) => {
-      console.log('[Socket] 📞 Call rejected by:', data.rejecterId);
-      window.dispatchEvent(new CustomEvent('void-call-rejected', { detail: data }));
-    });
-
-    socket.on('call-ended', (data) => {
-      console.log('[Socket] 📞 Call ended by:', data.enderId);
-      window.dispatchEvent(new CustomEvent('void-call-ended', { detail: data }));
-    });
-
-    socket.on('ice-candidate', (data) => {
-      window.dispatchEvent(new CustomEvent('void-ice-candidate', { detail: data }));
-    });
-
-    socket.on('call-error', (data) => {
-      // Only log, don't show error to user for "user unavailable"
-      console.log('[Socket] 📞 Call error:', data.message);
-      window.dispatchEvent(new CustomEvent('void-call-error', { detail: data }));
-    });
-
-    socket.on('remote-screen-start', (data) => {
-      window.dispatchEvent(new CustomEvent('void-remote-screen-start', { detail: data }));
-    });
-
-    socket.on('remote-screen-stop', (data) => {
-      window.dispatchEvent(new CustomEvent('void-remote-screen-stop', { detail: data }));
-    });
-
-    socket.on('remote-canvas-draw', (data) => {
-      window.dispatchEvent(new CustomEvent('void-remote-canvas-draw', { detail: data }));
-    });
-
-    socket.on('remote-document', (data) => {
-      window.dispatchEvent(new CustomEvent('void-remote-document', { detail: data }));
-    });
-
-    return () => {
-      console.log('[Socket] Cleanup for user effect');
-      if (heartbeatRef.current) {
-        clearInterval(heartbeatRef.current);
-        heartbeatRef.current = null;
-      }
-      // Don't disconnect on cleanup - keep connection alive
-      // Only disconnect on logout
+      }, 30000);
     };
-  }, [user?.id]);
+    
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        handleMessage(msg);
+      } catch (e) {
+        console.error('[WS] Parse error:', e);
+      }
+    };
+    
+    ws.onclose = () => {
+      console.log('[WS] Disconnected');
+      setIsConnected(false);
+      
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+        heartbeatRef.current = null;
+      }
+      
+      if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+        const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+        reconnectAttempts++;
+        
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (globalUserId) {
+            const newWs = new WebSocket(`${getWorkersUrl()}/ws/user/${globalUserId}`);
+            globalWs = newWs;
+            wsRef.current = newWs;
+          }
+        }, delay);
+      }
+    };
+    
+    ws.onerror = (e) => {
+      console.error('[WS] Error:', e);
+    };
+    
+    return () => {
+      if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+    };
+  }, [user?.id, getWorkersUrl]);
+
+  // Handle incoming messages
+  const handleMessage = useCallback((msg: any) => {
+    console.log('[WS] Message:', msg.type);
+    
+    switch (msg.type) {
+      case 'message':
+        const message = msg.data;
+        const currentChat = useChatStore.getState().activeChat;
+        
+        if (currentChat && message.senderId === currentChat.id) {
+          useChatStore.getState().addMessage(message);
+        }
+        
+        const contacts = useChatStore.getState().contacts;
+        const existingContact = contacts.find(c => c.id === message.senderId);
+        if (existingContact) {
+          useChatStore.getState().setContacts(contacts.map(c =>
+            c.id === message.senderId
+              ? { ...c, lastMessage: message, unreadCount: (c.unreadCount || 0) + 1 }
+              : c
+          ));
+        }
+        
+        if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+          new Notification('Новое сообщение', { body: message.content || 'Голосовое сообщение' });
+        }
+        break;
+        
+      case 'typing':
+        useChatStore.getState().setTypingUser(msg.senderId || '', '', msg.action === 'start');
+        break;
+        
+      case 'presence':
+        const presenceContacts = useChatStore.getState().contacts;
+        if (msg.action === 'online') {
+          useChatStore.getState().setContacts(presenceContacts.map(c =>
+            c.id === msg.data.userId ? { ...c, isOnline: true } : c
+          ));
+        } else if (msg.action === 'offline') {
+          useChatStore.getState().setContacts(presenceContacts.map(c =>
+            c.id === msg.data.userId ? { ...c, isOnline: false, lastSeen: new Date().toISOString() } : c
+          ));
+        }
+        break;
+        
+      case 'contact':
+        if (msg.action === 'new') {
+          const newContact = msg.data;
+          const existingContacts = useChatStore.getState().contacts;
+          
+          if (!existingContacts.find(c => c.id === newContact.id)) {
+            useChatStore.getState().addContact({
+              id: newContact.id,
+              username: newContact.username || 'Unknown',
+              displayName: newContact.displayName || null,
+              avatar: newContact.avatar || null,
+              bio: newContact.bio || null,
+              status: newContact.status || null,
+              isOnline: newContact.isOnline ?? true,
+              lastSeen: null,
+              unreadCount: 0,
+              lastMessage: null
+            });
+          }
+          
+          if ('Notification' in window && Notification.permission === 'granted') {
+            new Notification('Новый контакт', {
+              body: `${newContact.displayName || newContact.username} добавил вас в друзья`
+            });
+          }
+        }
+        break;
+        
+      case 'incoming-call':
+        window.dispatchEvent(new CustomEvent('void-incoming-call', { detail: msg.data }));
+        break;
+        
+      case 'call-answered':
+        window.dispatchEvent(new CustomEvent('void-call-answered', { detail: msg.data }));
+        break;
+        
+      case 'call-rejected':
+        window.dispatchEvent(new CustomEvent('void-call-rejected', { detail: msg.data }));
+        break;
+        
+      case 'call-ended':
+        window.dispatchEvent(new CustomEvent('void-call-ended', { detail: msg.data }));
+        break;
+        
+      case 'ice-candidate':
+        window.dispatchEvent(new CustomEvent('void-ice-candidate', { detail: msg.data }));
+        break;
+    }
+  }, []);
 
   // Request notification permission
   useEffect(() => {
@@ -243,114 +209,108 @@ export function useSocket() {
     }
   }, []);
 
-  // Helper functions that use the socket ref
-  const getSocket = useCallback(() => socketRef.current || globalSocket, []);
+  // Send message through WebSocket
+  const send = useCallback((msg: any) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        ...msg,
+        timestamp: Date.now()
+      }));
+    } else {
+      console.warn('[WS] Cannot send - not connected');
+    }
+  }, []);
 
   const sendMessage = useCallback((receiverId: string | undefined, channelId: string | undefined, message: any) => {
-    const socket = getSocket();
-    if (socket?.connected && message) {
-      socket.emit('send-message', { receiverId, channelId, message });
-    } else {
-      console.warn('[Socket] Cannot send message - not connected');
-    }
-  }, [getSocket]);
+    send({
+      type: 'message',
+      action: 'new',
+      data: {
+        ...message,
+        receiverId,
+        channelId
+      }
+    });
+  }, [send]);
 
   const sendTyping = useCallback((targetId: string, isTyping: boolean) => {
-    const socket = getSocket();
-    if (socket?.connected && targetId) {
-      socket.emit('typing', { targetId, isTyping });
-    }
-  }, [getSocket]);
+    send({
+      type: 'typing',
+      action: isTyping ? 'start' : 'stop',
+      data: { targetId }
+    });
+  }, [send]);
 
   const notifyContactAdded = useCallback((contactId: string, contact: any) => {
-    const socket = getSocket();
-    if (socket?.connected && contactId) {
-      socket.emit('contact-added', { contactId, contact });
-    }
-  }, [getSocket]);
+    send({
+      type: 'contact',
+      action: 'new',
+      data: {
+        id: globalUserId,
+        ...contact
+      }
+    });
+  }, [send]);
 
   const markAsRead = useCallback((targetId: string) => {
-    const socket = getSocket();
-    if (socket?.connected && targetId) {
-      socket.emit('mark-read', { targetId });
-    }
-  }, [getSocket]);
+    send({
+      type: 'read',
+      action: 'mark',
+      data: { targetId }
+    });
+  }, [send]);
 
   const callUser = useCallback((targetId: string, signal: any, callType: 'voice' | 'video', callerName: string) => {
-    const socket = getSocket();
-    if (socket?.connected && targetId) {
-      console.log('[Socket] 📞 Calling:', targetId);
-      socket.emit('call-user', { targetId, signal, callType, callerName });
-    } else {
-      console.error('[Socket] Cannot call - not connected');
-      // Show error to user
-      window.dispatchEvent(new CustomEvent('void-call-error', { 
+    if (!isConnected) {
+      window.dispatchEvent(new CustomEvent('void-call-error', {
         detail: { message: 'Нет соединения с сервером. Попробуйте обновить страницу.' }
       }));
+      return;
     }
-  }, [getSocket]);
+    
+    send({
+      type: 'call',
+      action: 'start',
+      data: {
+        targetId,
+        signal,
+        callType,
+        callerName
+      }
+    });
+  }, [send, isConnected]);
 
   const answerCall = useCallback((targetId: string, signal: any) => {
-    const socket = getSocket();
-    if (socket?.connected && targetId) {
-      console.log('[Socket] 📞 Answering call to:', targetId);
-      socket.emit('call-answer', { targetId, signal });
-    }
-  }, [getSocket]);
+    send({
+      type: 'call',
+      action: 'answer',
+      data: { targetId, signal }
+    });
+  }, [send]);
 
   const rejectCall = useCallback((targetId: string) => {
-    const socket = getSocket();
-    if (socket?.connected) {
-      socket.emit('call-reject', { targetId });
-    }
-  }, [getSocket]);
+    send({
+      type: 'call',
+      action: 'reject',
+      data: { targetId }
+    });
+  }, [send]);
 
   const endCall = useCallback((targetId: string) => {
-    const socket = getSocket();
-    if (socket?.connected) {
-      socket.emit('call-end', { targetId });
-    }
-  }, [getSocket]);
+    send({
+      type: 'call',
+      action: 'end',
+      data: { targetId }
+    });
+  }, [send]);
 
   const sendIceCandidate = useCallback((targetId: string, candidate: any) => {
-    const socket = getSocket();
-    if (socket?.connected && targetId) {
-      socket.emit('ice-candidate', { targetId, candidate });
-    }
-  }, [getSocket]);
-
-  const notifyScreenShareStart = useCallback((targetId: string) => {
-    const socket = getSocket();
-    if (socket?.connected) {
-      socket.emit('screen-share-start', { targetId });
-    }
-  }, [getSocket]);
-
-  const notifyScreenShareStop = useCallback((targetId: string) => {
-    const socket = getSocket();
-    if (socket?.connected) {
-      socket.emit('screen-share-stop', { targetId });
-    }
-  }, [getSocket]);
-
-  const sendCanvasDraw = useCallback((targetId: string, from: {x: number, y: number}, to: {x: number, y: number}, color: string, size: number) => {
-    const socket = getSocket();
-    if (socket?.connected && targetId) {
-      socket.emit('canvas-draw', { targetId, from, to, color, size });
-    }
-  }, [getSocket]);
-
-  const sendDocumentUpdate = useCallback((targetId: string, text: string) => {
-    const socket = getSocket();
-    if (socket?.connected && targetId) {
-      socket.emit('document-update', { targetId, text });
-    }
-  }, [getSocket]);
-
-  const isConnected = useCallback(() => {
-    const socket = getSocket();
-    return socket?.connected ?? false;
-  }, [getSocket]);
+    send({
+      type: 'call',
+      action: 'ice',
+      data: { targetId, candidate }
+    });
+  }, [send]);
 
   return {
     sendMessage,
@@ -362,10 +322,10 @@ export function useSocket() {
     rejectCall,
     endCall,
     sendIceCandidate,
-    notifyScreenShareStart,
-    notifyScreenShareStop,
-    sendCanvasDraw,
-    sendDocumentUpdate,
-    isConnected,
+    notifyScreenShareStart: () => {},
+    notifyScreenShareStop: () => {},
+    sendCanvasDraw: () => {},
+    sendDocumentUpdate: () => {},
+    isConnected: () => isConnected,
   };
 }
