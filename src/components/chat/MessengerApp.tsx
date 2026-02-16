@@ -36,7 +36,9 @@ export function MessengerApp() {
     answerCall,
     rejectCall,
     endCall: socketEndCall,
-    sendIceCandidate
+    sendIceCandidate,
+    notifyScreenShareStart,
+    notifyScreenShareStop
   } = useSocket();
 
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
@@ -147,11 +149,23 @@ export function MessengerApp() {
       sendIceCandidate(targetId, candidate);
     };
 
+    const handleSocketScreenStart = (e: CustomEvent) => {
+      const { targetId } = e.detail;
+      notifyScreenShareStart(targetId);
+    };
+
+    const handleSocketScreenStop = (e: CustomEvent) => {
+      const { targetId } = e.detail;
+      notifyScreenShareStop(targetId);
+    };
+
     window.addEventListener('void-socket-call', handleSocketCall as EventListener);
     window.addEventListener('void-socket-answer', handleSocketAnswer as EventListener);
     window.addEventListener('void-socket-reject', handleSocketReject as EventListener);
     window.addEventListener('void-socket-end', handleSocketEnd as EventListener);
     window.addEventListener('void-socket-ice', handleSocketIce as EventListener);
+    window.addEventListener('void-socket-screen-start', handleSocketScreenStart as EventListener);
+    window.addEventListener('void-socket-screen-stop', handleSocketScreenStop as EventListener);
 
     return () => {
       window.removeEventListener('void-socket-call', handleSocketCall as EventListener);
@@ -159,8 +173,10 @@ export function MessengerApp() {
       window.removeEventListener('void-socket-reject', handleSocketReject as EventListener);
       window.removeEventListener('void-socket-end', handleSocketEnd as EventListener);
       window.removeEventListener('void-socket-ice', handleSocketIce as EventListener);
+      window.removeEventListener('void-socket-screen-start', handleSocketScreenStart as EventListener);
+      window.removeEventListener('void-socket-screen-stop', handleSocketScreenStop as EventListener);
     };
-  }, [user, callUser, answerCall, rejectCall, socketEndCall, sendIceCandidate]);
+  }, [user, callUser, answerCall, rejectCall, socketEndCall, sendIceCandidate, notifyScreenShareStart, notifyScreenShareStop]);
 
   const checkAuth = useCallback(async () => {
     if (!token) {

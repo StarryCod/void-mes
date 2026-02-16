@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useCallback, useState } from 'react';
+import { useRef, useCallback, useState, useEffect } from 'react';
 
 // ICE servers for NAT traversal
 const ICE_SERVERS = [
@@ -33,76 +33,39 @@ export function useWebRTCCall(options: CallOptions = {}) {
   const [isCalling, setIsCalling] = useState(false);
   const [callType, setCallType] = useState<'voice' | 'video'>('voice');
   
-  // Connect to call signaling WebSocket
-  const connectToCall = useCallback((callId: string, userId: string, targetId: string) => {
-    return new Promise<WebSocket>((resolve, reject) => {
-      const wsUrl = `${workersUrl}/ws/call/${callId}?userId=${userId}`;
-      console.log('[Call] Connecting to signaling:', wsUrl);
-      
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-      callIdRef.current = callId;
-      userIdRef.current = userId;
-      targetIdRef.current = targetId;
-      
-      ws.onopen = () => {
-        console.log('[Call] Signaling connected');
-        resolve(ws);
-      };
-      
-      ws.onerror = (error) => {
-        console.error('[Call] Signaling error:', error);
-        reject(error);
-      };
-      
-      ws.onmessage = async (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          console.log('[Call] Signaling message:', msg.type);
-          
-          switch (msg.type) {
-            case 'incoming-call':
-              options.onIncomingCall?.({
-                callerId: msg.callerId,
-                callType: msg.callType,
-                signal: msg.signal,
-                callId: msg.callId,
-              });
-              break;
-              
-            case 'call-answered':
-              if (pcRef.current && msg.signal) {
-                await pcRef.current.setRemoteDescription(new RTCSessionDescription(msg.signal));
-                options.onCallAnswered?.({ answererId: msg.answererId });
-              }
-              break;
-              
-            case 'call-rejected':
-              options.onCallRejected?.();
-              cleanup();
-              break;
-              
-            case 'call-ended':
-              options.onCallEnded?.();
-              cleanup();
-              break;
-              
-            case 'ice-candidate':
-              if (pcRef.current && msg.candidate) {
-                await pcRef.current.addIceCandidate(new RTCIceCandidate(msg.candidate));
-              }
-              break;
-          }
-        } catch (e) {
-          console.error('[Call] Failed to handle message:', e);
-        }
-      };
-      
-      ws.onclose = () => {
-        console.log('[Call] Signaling disconnected');
-      };
-    });
-  }, [workersUrl, options]);
+  // Cleanup function - defined first with refs to avoid hoisting issues
+  const cleanupRef = useRef<() => void>(() => {});
+  
+  const cleanup = useCallback(() => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(t => t.stop());
+      localStreamRef.current = null;
+    }
+    
+    if (remoteStreamRef.current) {
+      remoteStreamRef.current.getTracks().forEach(t => t.stop());
+      remoteStreamRef.current = null;
+    }
+    
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+    
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    
+    callIdRef.current = null;
+    setIsInCall(false);
+    setIsCalling(false);
+  }, []);
+  
+  // Update ref in effect to avoid render-time ref access
+  useEffect(() => {
+    cleanupRef.current = cleanup;
+  }, [cleanup]);
   
   // Create peer connection
   const createPeerConnection = useCallback(async (video: boolean) => {
@@ -162,12 +125,83 @@ export function useWebRTCCall(options: CallOptions = {}) {
         setIsInCall(true);
         setIsCalling(false);
       } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
-        cleanup();
+        cleanupRef.current();
       }
     };
     
     return pc;
   }, []);
+  
+  // Connect to call signaling WebSocket
+  const connectToCall = useCallback((callId: string, userId: string, targetId: string) => {
+    return new Promise<WebSocket>((resolve, reject) => {
+      const wsUrl = `${workersUrl}/ws/call/${callId}?userId=${userId}`;
+      console.log('[Call] Connecting to signaling:', wsUrl);
+      
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+      callIdRef.current = callId;
+      userIdRef.current = userId;
+      targetIdRef.current = targetId;
+      
+      ws.onopen = () => {
+        console.log('[Call] Signaling connected');
+        resolve(ws);
+      };
+      
+      ws.onerror = (error) => {
+        console.error('[Call] Signaling error:', error);
+        reject(error);
+      };
+      
+      ws.onmessage = async (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          console.log('[Call] Signaling message:', msg.type);
+          
+          switch (msg.type) {
+            case 'incoming-call':
+              options.onIncomingCall?.({
+                callerId: msg.callerId,
+                callType: msg.callType,
+                signal: msg.signal,
+                callId: msg.callId,
+              });
+              break;
+              
+            case 'call-answered':
+              if (pcRef.current && msg.signal) {
+                await pcRef.current.setRemoteDescription(new RTCSessionDescription(msg.signal));
+                options.onCallAnswered?.({ answererId: msg.answererId });
+              }
+              break;
+              
+            case 'call-rejected':
+              options.onCallRejected?.();
+              cleanupRef.current();
+              break;
+              
+            case 'call-ended':
+              options.onCallEnded?.();
+              cleanupRef.current();
+              break;
+              
+            case 'ice-candidate':
+              if (pcRef.current && msg.candidate) {
+                await pcRef.current.addIceCandidate(new RTCIceCandidate(msg.candidate));
+              }
+              break;
+          }
+        } catch (e) {
+          console.error('[Call] Failed to handle message:', e);
+        }
+      };
+      
+      ws.onclose = () => {
+        console.log('[Call] Signaling disconnected');
+      };
+    });
+  }, [workersUrl, options]);
   
   // Start call
   const startCall = useCallback(async (
@@ -209,7 +243,7 @@ export function useWebRTCCall(options: CallOptions = {}) {
     } catch (error) {
       console.error('[Call] Failed to start call:', error);
       options.onError?.('Не удалось начать звонок');
-      cleanup();
+      cleanupRef.current();
       return null;
     }
   }, [connectToCall, createPeerConnection, options]);
@@ -248,7 +282,7 @@ export function useWebRTCCall(options: CallOptions = {}) {
     } catch (error) {
       console.error('[Call] Failed to answer call:', error);
       options.onError?.('Не удалось ответить на звонок');
-      cleanup();
+      cleanupRef.current();
     }
   }, [connectToCall, createPeerConnection, options]);
   
@@ -258,7 +292,7 @@ export function useWebRTCCall(options: CallOptions = {}) {
       type: 'call-reject',
       targetId,
     }));
-    cleanup();
+    cleanupRef.current();
   }, []);
   
   // End call
@@ -267,34 +301,7 @@ export function useWebRTCCall(options: CallOptions = {}) {
       type: 'call-end',
       targetId: targetIdRef.current,
     }));
-    cleanup();
-  }, []);
-  
-  // Cleanup
-  const cleanup = useCallback(() => {
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(t => t.stop());
-      localStreamRef.current = null;
-    }
-    
-    if (remoteStreamRef.current) {
-      remoteStreamRef.current.getTracks().forEach(t => t.stop());
-      remoteStreamRef.current = null;
-    }
-    
-    if (pcRef.current) {
-      pcRef.current.close();
-      pcRef.current = null;
-    }
-    
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    
-    callIdRef.current = null;
-    setIsInCall(false);
-    setIsCalling(false);
+    cleanupRef.current();
   }, []);
   
   // Get streams
