@@ -1,0 +1,22 @@
+name = "void-time"
+main = "cf-workers/src/index.ts"
+compatibility_date = "2024-12-30"
+
+# Durable Objects binding
+[[durable_objects.bindings]]
+name = "CHAT_ROOM"
+class_name = "ChatRoom"
+
+[[durable_objects.bindings]]
+name = "CALL_ROOM"
+class_name = "CallRoom"
+
+# Durable Objects migrations
+[[migrations]]
+tag = "v1"
+new_classes = ["ChatRoom", "CallRoom"]
+
+# Environment variables (set via wrangler secret or dashboard)
+[vars]
+APPWRITE_ENDPOINT = "https://fra.cloud.appwrite.io/v1"
+APPWRITE_PROJECT_ID = "69923291001c25654226"
