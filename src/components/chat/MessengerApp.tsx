@@ -9,12 +9,13 @@ import { AuthForm } from '@/components/auth/AuthForm';
 import { VoidLogo } from '@/components/common/VoidLogo';
 import { CallManager } from '@/components/call/CallManager';
 import { useSocket } from '@/hooks/useSocket';
+import { useAppwriteRealtime } from '@/hooks/useAppwriteRealtime';
 import { useToast } from '@/hooks/use-toast';
 import {
   Plus, MessageSquare, Hash, X, Check, LogOut, Settings,
   Phone, Video, MoreVertical, Mic, Send, CheckCheck,
   Image as ImageIcon, FileText, PhoneOff, Sparkles, Play, Pause,
-  Trash2, Eraser, Copy, Forward, MoreHorizontal
+  Trash2, Eraser, Copy, Forward, MoreHorizontal, Users
 } from 'lucide-react';
 
 export function MessengerApp() {
@@ -232,34 +233,40 @@ export function MessengerApp() {
     if (activeTarget && token) fetchMessages(true);
   }, [activeTarget?.id, token]);
 
-  // Smart polling - only update if new messages exist
-  const lastMessageIdRef = useRef<string | null>(null);
-  
-  useEffect(() => {
-    if (!activeTarget || !token) return;
+  // Appwrite Realtime - fetch single message when event received
+  const fetchSingleMessage = useCallback(async (messageId: string) => {
+    if (!token || !activeTarget) return;
     
-    const pollInterval = setInterval(async () => {
-      try {
-        const endpoint = isChannel 
-          ? `/api/messages?channelId=${activeTarget.id}`
-          : `/api/messages?contactId=${activeTarget.id}`;
-        const res = await fetch(endpoint, { headers: { Authorization: `Bearer ${token}` } });
-        const data = await res.json();
-        const newMessages = Array.isArray(data?.messages) ? data.messages : [];
-        
-        // Only update if there are new messages
-        if (newMessages.length > 0) {
-          const newestId = newMessages[newMessages.length - 1]?.id;
-          if (newestId !== lastMessageIdRef.current) {
-            lastMessageIdRef.current = newestId;
-            setMessages(newMessages);
-          }
+    try {
+      // Fetch all messages and find the new one (simple approach)
+      const endpoint = isChannel 
+        ? `/api/messages?channelId=${activeTarget.id}`
+        : `/api/messages?contactId=${activeTarget.id}`;
+      const res = await fetch(endpoint, { headers: { Authorization: `Bearer ${token}` } });
+      const data = await res.json();
+      const allMessages = Array.isArray(data?.messages) ? data.messages : [];
+      
+      // Find the new message
+      const newMsg = allMessages.find((m: Message) => m.id === messageId);
+      if (newMsg) {
+        const currentMessages = useChatStore.getState().messages || [];
+        // Only add if not already present
+        if (!currentMessages.find((m: Message) => m.id === messageId)) {
+          setMessages([...currentMessages, newMsg]);
         }
-      } catch (e) {}
-    }, 1000);
-    
-    return () => clearInterval(pollInterval);
-  }, [activeTarget?.id, token, isChannel]);
+      }
+    } catch (e) {
+      console.error('Failed to fetch new message:', e);
+    }
+  }, [token, activeTarget?.id, isChannel]);
+
+  // Setup Appwrite Realtime
+  useAppwriteRealtime(
+    user?.id || null,
+    activeChat?.id || null,
+    activeChannel?.id || null,
+    fetchSingleMessage
+  );
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -278,9 +285,6 @@ export function MessengerApp() {
       const data = await res.json();
       const msgs = Array.isArray(data?.messages) ? data.messages : [];
       setMessages(msgs);
-      if (msgs.length > 0) {
-        lastMessageIdRef.current = msgs[msgs.length - 1]?.id;
-      }
     } catch (e) {
       setMessages([]);
     } finally {
@@ -773,38 +777,102 @@ export function MessengerApp() {
   if (!user) return <AuthForm onSuccess={() => {}} />;
 
   return (
-    <div className="fixed inset-0 flex bg-[#13131a] overflow-hidden">
-      {/* LEFT SIDEBAR - Shows on mobile when no active chat, always on desktop */}
-      <div className={`${activeTarget ? 'hidden md:flex' : 'flex'} w-full md:w-60 bg-[#0f0f14] flex-col border-r border-white/5 shrink-0`}>
-        {/* Header */}
-        <div className="h-14 px-4 flex items-center justify-between border-b border-white/5">
-          <h1 className="text-white font-bold text-lg">Void Mes</h1>
-          <button
-            onClick={() => activeView === 'dms' ? setShowAddModal(true) : setShowChannelModal(true)}
-            className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-white"
-          >
+    <div className="fixed inset-0 flex flex-col bg-[#13131a] overflow-hidden">
+      {/* DISCORD-STYLE TOP TOOLBAR - Always visible on mobile */}
+      <div className="h-12 bg-[#1a1a24] border-b border-white/5 flex items-center shrink-0 md:hidden">
+        {/* Left: User avatar */}
+        <button 
+          onClick={() => setShowUserMenu(!showUserMenu)}
+          className="w-12 h-12 flex items-center justify-center"
+        >
+          <Avatar className="w-8 h-8">
+            <AvatarFallback className="bg-gradient-to-br from-purple-500 to-pink-500 text-white text-xs">
+              {initials(user?.displayName || null, user?.username || '')}
+            </AvatarFallback>
+          </Avatar>
+        </button>
+        
+        {/* Center: Tabs as icons when chat is open, full tabs when no chat */}
+        <div className="flex-1 flex items-center justify-center gap-2">
+          {activeTarget ? (
+            /* Collapsed view - just icons */
+            <>
+              <button 
+                onClick={() => { setActiveView('dms'); setActiveChat(null); setActiveChannel(null); }}
+                className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors ${activeView === 'dms' ? 'bg-purple-500/20 text-purple-400' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+              >
+                <MessageSquare className="w-5 h-5" />
+              </button>
+              <button 
+                onClick={() => { setActiveView('channels'); setActiveChat(null); setActiveChannel(null); }}
+                className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors ${activeView === 'channels' ? 'bg-purple-500/20 text-purple-400' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+              >
+                <Hash className="w-5 h-5" />
+              </button>
+            </>
+          ) : (
+            /* Expanded view - tabs with labels */
+            <>
+              <button 
+                onClick={() => setActiveView('dms')} 
+                className={`flex-1 max-w-[120px] py-2 rounded-lg text-sm font-medium transition-all ${activeView === 'dms' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white'}`}
+              >
+                Сообщения
+              </button>
+              <button 
+                onClick={() => setActiveView('channels')} 
+                className={`flex-1 max-w-[120px] py-2 rounded-lg text-sm font-medium transition-all ${activeView === 'channels' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white'}`}
+              >
+                Каналы
+              </button>
+            </>
+          )}
+        </div>
+        
+        {/* Right: Add button */}
+        <button
+          onClick={() => activeView === 'dms' ? setShowAddModal(true) : setShowChannelModal(true)}
+          className="w-12 h-12 flex items-center justify-center"
+        >
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-white">
             <Plus className="w-4 h-4" />
-          </button>
-        </div>
-        
-        {/* Tabs */}
-        <div className="flex gap-1 p-2">
-          <button 
-            onClick={() => setActiveView('dms')} 
-            className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${activeView === 'dms' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
-          >
-            Сообщения
-          </button>
-          <button 
-            onClick={() => setActiveView('channels')} 
-            className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${activeView === 'channels' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
-          >
-            Каналы
-          </button>
-        </div>
-        
-        {/* List */}
-        <div className="flex-1 overflow-y-auto px-2">
+          </div>
+        </button>
+      </div>
+
+      {/* MAIN CONTENT AREA */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* LEFT SIDEBAR - Hidden on mobile when chat is open, always visible on desktop */}
+        <div className={`${activeTarget ? 'hidden md:flex' : 'flex'} w-full md:w-60 bg-[#0f0f14] flex-col border-r border-white/5 shrink-0`}>
+          {/* Desktop Header */}
+          <div className="h-14 px-4 items-center justify-between border-b border-white/5 hidden md:flex">
+            <h1 className="text-white font-bold text-lg">Void Mes</h1>
+            <button
+              onClick={() => activeView === 'dms' ? setShowAddModal(true) : setShowChannelModal(true)}
+              className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-white"
+            >
+              <Plus className="w-4 h-4" />
+            </button>
+          </div>
+          
+          {/* Desktop Tabs */}
+          <div className="gap-1 p-2 hidden md:flex">
+            <button 
+              onClick={() => setActiveView('dms')} 
+              className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${activeView === 'dms' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+            >
+              Сообщения
+            </button>
+            <button 
+              onClick={() => setActiveView('channels')} 
+              className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${activeView === 'channels' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+            >
+              Каналы
+            </button>
+          </div>
+          
+          {/* List */}
+          <div className="flex-1 overflow-y-auto px-2">
           <AnimatePresence mode="wait">
             {activeView === 'dms' ? (
               <motion.div key="dms" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-1">
@@ -918,17 +986,7 @@ export function MessengerApp() {
       {/* CHAT WINDOW - Shows only when there's an active chat */}
       <div className={`${activeTarget ? 'flex' : 'hidden md:flex'} flex-1 flex-col bg-[#13131a] min-w-0 h-full`}>
         {activeTarget ? (
-          <div className="h-14 px-4 flex items-center gap-3 border-b border-white/5 bg-[#1a1a24] shrink-0">
-            {/* Back button for mobile */}
-            <button 
-              onClick={() => {
-                setActiveChat(null);
-                setActiveChannel(null);
-              }}
-              className="w-9 h-9 rounded-full hover:bg-white/5 flex items-center justify-center text-gray-400 hover:text-white sm:hidden"
-            >
-              <X className="w-5 h-5" />
-            </button>
+          <div className="h-14 px-4 items-center gap-3 border-b border-white/5 bg-[#1a1a24] shrink-0 hidden md:flex">
             {isChannel ? (
               <div className="w-9 h-9 rounded-lg bg-[#242430] flex items-center justify-center text-gray-400">
                 <span className="text-lg">#</span>
@@ -1479,8 +1537,6 @@ export function MessengerApp() {
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* No Mobile Bottom Navigation - using sidebar instead */}
 
       {/* Call Manager - WebRTC */}
       {user && (

@@ -43,3 +43,24 @@ Stage Summary:
 - Local development now uses SQLite instead of requiring PostgreSQL connection
 
 ---
+Task ID: 3
+Agent: Main Agent
+Task: Discord-style mobile UI, Appwrite Realtime, fix attachments
+
+Work Log:
+- Removed polling completely from MessengerApp
+- Created useAppwriteRealtime hook for real-time message events
+- Updated API messages to create Appwrite event after saving to Neon
+- Redesigned mobile UI with Discord-style top toolbar:
+  - Always visible toolbar on mobile
+  - Collapses to icons when chat is open
+  - Expands to tabs when no chat selected
+- Removed duplicate chat header on mobile (kept only on desktop)
+- Fixed attachment saving to database (Prisma nested create)
+
+Architecture:
+- Messages stored in Neon (PostgreSQL) - reliable SQL storage
+- Appwrite Realtime events for notifications - free, no servers
+- When Appwrite event received → frontend fetches from Neon
+
+---

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
+import { createAppwriteClient, DATABASE_ID, COLLECTIONS, ID } from '@/lib/appwrite/server';
 
 export async function GET(request: NextRequest) {
   try {
@@ -98,7 +99,7 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { receiverId, channelId, content, replyToId, isVoice, voiceDuration, voiceUrl, attachments } = body;
 
-    // Create message with attachments
+    // Create message with attachments in Neon (primary storage)
     const message = await db.message.create({
       data: {
         content: content || '',
@@ -110,7 +111,6 @@ export async function POST(request: NextRequest) {
         isVoice: isVoice || false,
         voiceDuration: voiceDuration || null,
         voiceUrl: voiceUrl || null,
-        // Create attachments in database
         attachments: attachments && attachments.length > 0 ? {
           create: attachments.map((att: any) => ({
             url: att.url,
@@ -124,6 +124,28 @@ export async function POST(request: NextRequest) {
         attachments: true,
       }
     });
+
+    // Create lightweight event in Appwrite for realtime notification
+    try {
+      const { databases } = createAppwriteClient();
+      await databases.createDocument(
+        DATABASE_ID,
+        COLLECTIONS.MESSAGES,
+        ID.unique(),
+        {
+          messageId: message.id,
+          senderId: userId,
+          receiverId: receiverId || '',
+          channelId: channelId || '',
+          type: 'new',
+          timestamp: Date.now(),
+        }
+      );
+      console.log('[Appwrite] Message event created:', message.id);
+    } catch (appwriteError) {
+      // Don't fail the request if Appwrite fails
+      console.error('[Appwrite] Failed to create event (non-critical):', appwriteError);
+    }
 
     return NextResponse.json({
       message: {
