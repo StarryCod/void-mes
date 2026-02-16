@@ -10,7 +10,7 @@ let globalUserId: string | null = null;
 let reconnectTimeout: NodeJS.Timeout | null = null;
 
 // Cloudflare Workers URL (will be set via env or fallback)
-const CF_WORKERS_URL = process.env.NEXT_PUBLIC_CF_WORKERS_URL || 'https://void-realtime.starrycod.workers.dev';
+const CF_WORKERS_URL = process.env.NEXT_PUBLIC_CF_WORKERS_URL || 'https://void-time.starrycod.workers.dev';
 
 export function useWebSocket() {
   const user = useAuthStore((state) => state.user);
