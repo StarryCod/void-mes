@@ -70,6 +70,7 @@ export function MessengerApp() {
   
   // Chat
   const [newMessage, setNewMessage] = useState('');
+  const [isSending, setIsSending] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [replyTo, setReplyTo] = useState<Message | null>(null);
   const [showAttach, setShowAttach] = useState(false);
@@ -228,19 +229,37 @@ export function MessengerApp() {
   };
 
   useEffect(() => {
-    if (activeTarget && token) fetchMessages();
+    if (activeTarget && token) fetchMessages(true);
   }, [activeTarget?.id, token]);
 
-  // Polling for messages every 500ms when chat is active (fallback for realtime)
+  // Smart polling - only update if new messages exist
+  const lastMessageIdRef = useRef<string | null>(null);
+  
   useEffect(() => {
     if (!activeTarget || !token) return;
     
-    const pollInterval = setInterval(() => {
-      fetchMessages();
-    }, 500);
+    const pollInterval = setInterval(async () => {
+      try {
+        const endpoint = isChannel 
+          ? `/api/messages?channelId=${activeTarget.id}`
+          : `/api/messages?contactId=${activeTarget.id}`;
+        const res = await fetch(endpoint, { headers: { Authorization: `Bearer ${token}` } });
+        const data = await res.json();
+        const newMessages = Array.isArray(data?.messages) ? data.messages : [];
+        
+        // Only update if there are new messages
+        if (newMessages.length > 0) {
+          const newestId = newMessages[newMessages.length - 1]?.id;
+          if (newestId !== lastMessageIdRef.current) {
+            lastMessageIdRef.current = newestId;
+            setMessages(newMessages);
+          }
+        }
+      } catch (e) {}
+    }, 1000);
     
     return () => clearInterval(pollInterval);
-  }, [activeTarget?.id, token]);
+  }, [activeTarget?.id, token, isChannel]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -248,16 +267,20 @@ export function MessengerApp() {
     }
   }, [safeMessages.length]);
 
-  const fetchMessages = async () => {
+  const fetchMessages = async (showLoading = false) => {
     if (!activeTarget || !token) return;
-    setIsLoading(true);
+    if (showLoading) setIsLoading(true);
     try {
       const endpoint = isChannel 
         ? `/api/messages?channelId=${activeTarget.id}`
         : `/api/messages?contactId=${activeTarget.id}`;
       const res = await fetch(endpoint, { headers: { Authorization: `Bearer ${token}` } });
       const data = await res.json();
-      setMessages(Array.isArray(data?.messages) ? data.messages : []);
+      const msgs = Array.isArray(data?.messages) ? data.messages : [];
+      setMessages(msgs);
+      if (msgs.length > 0) {
+        lastMessageIdRef.current = msgs[msgs.length - 1]?.id;
+      }
     } catch (e) {
       setMessages([]);
     } finally {
@@ -434,38 +457,39 @@ export function MessengerApp() {
     e.preventDefault();
     if ((!newMessage.trim() && attachments.length === 0) || !activeTarget || !user || !token) return;
 
+    setIsSending(true);
     const content = newMessage.trim();
     const tempId = `temp-${Date.now()}`;
 
-    const uploadedAttachments = [];
-    for (const att of attachments) {
-      const uploaded = await uploadFile(att.file);
-      if (uploaded) uploadedAttachments.push(uploaded);
-    }
-
-    const optimisticMsg: Message = {
-      id: tempId,
-      content: content,
-      senderId: user.id,
-      receiverId: activeChat?.id || null,
-      channelId: activeChannel?.id || null,
-      isRead: false,
-      readAt: null,
-      createdAt: new Date().toISOString(),
-      replyToId: replyTo?.id,
-      replyTo: replyTo,
-      attachments: uploadedAttachments.map(a => ({
-        id: a.url, url: a.url, type: a.type as 'image' | 'file' | 'video' | 'audio', name: a.name, size: 0
-      })),
-    };
-
-    addMessage(optimisticMsg);
-    setNewMessage('');
-    setReplyTo(null);
-    setAttachments([]);
-    setShowAttach(false);
-
     try {
+      const uploadedAttachments = [];
+      for (const att of attachments) {
+        const uploaded = await uploadFile(att.file);
+        if (uploaded) uploadedAttachments.push(uploaded);
+      }
+
+      const optimisticMsg: Message = {
+        id: tempId,
+        content: content,
+        senderId: user.id,
+        receiverId: activeChat?.id || null,
+        channelId: activeChannel?.id || null,
+        isRead: false,
+        readAt: null,
+        createdAt: new Date().toISOString(),
+        replyToId: replyTo?.id,
+        replyTo: replyTo,
+        attachments: uploadedAttachments.map(a => ({
+          id: a.url, url: a.url, type: a.type as 'image' | 'file' | 'video' | 'audio', name: a.name, size: 0
+        })),
+      };
+
+      addMessage(optimisticMsg);
+      setNewMessage('');
+      setReplyTo(null);
+      setAttachments([]);
+      setShowAttach(false);
+
       const res = await fetch('/api/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -487,6 +511,13 @@ export function MessengerApp() {
       }
     } catch (e) {
       console.error('Send error:', e);
+      toast({
+        title: 'Ошибка',
+        description: 'Не удалось отправить сообщение',
+        variant: 'destructive',
+      });
+    } finally {
+      setIsSending(false);
     }
   };
 
@@ -743,83 +774,144 @@ export function MessengerApp() {
 
   return (
     <div className="fixed inset-0 flex bg-[#13131a] overflow-hidden">
-      {/* LEFT SIDEBAR */}
-      <div className="w-20 bg-[#0f0f14] flex flex-col items-center py-3 gap-2 border-r border-white/5 shrink-0 hidden sm:flex">
-        <motion.button
-          whileHover={{ scale: 1.1 }}
-          whileTap={{ scale: 0.9 }}
-          onClick={() => activeView === 'dms' ? setShowAddModal(true) : setShowChannelModal(true)}
-          className="w-12 h-12 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-white shadow-lg shadow-purple-500/20"
-        >
-          <Plus className="w-6 h-6" />
-        </motion.button>
-
-        <div className="w-10 h-0.5 bg-white/10 rounded-full my-1" />
-
-        <div className="flex flex-col gap-1 bg-[#1a1a24] rounded-xl p-1">
-          <button onClick={() => setActiveView('dms')} className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all ${activeView === 'dms' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white'}`}>
-            <MessageSquare className="w-5 h-5" />
-          </button>
-          <button onClick={() => setActiveView('channels')} className={`w-10 h-10 rounded-lg flex items-center justify-center transition-all ${activeView === 'channels' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white'}`}>
-            <Hash className="w-5 h-5" />
+      {/* LEFT SIDEBAR - Desktop only, shows names */}
+      <div className="w-60 bg-[#0f0f14] flex flex-col border-r border-white/5 shrink-0 hidden md:flex">
+        {/* Header */}
+        <div className="h-14 px-4 flex items-center justify-between border-b border-white/5">
+          <h1 className="text-white font-bold text-lg">Void Mes</h1>
+          <button
+            onClick={() => activeView === 'dms' ? setShowAddModal(true) : setShowChannelModal(true)}
+            className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-white"
+          >
+            <Plus className="w-4 h-4" />
           </button>
         </div>
-
-        <div className="w-10 h-0.5 bg-white/10 rounded-full my-1" />
-
-        <div className="flex-1 overflow-y-auto w-full flex flex-col items-center gap-2 py-2">
+        
+        {/* Tabs */}
+        <div className="flex gap-1 p-2">
+          <button 
+            onClick={() => setActiveView('dms')} 
+            className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${activeView === 'dms' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+          >
+            Сообщения
+          </button>
+          <button 
+            onClick={() => setActiveView('channels')} 
+            className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${activeView === 'channels' ? 'bg-purple-500 text-white' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
+          >
+            Каналы
+          </button>
+        </div>
+        
+        {/* List */}
+        <div className="flex-1 overflow-y-auto px-2">
           <AnimatePresence mode="wait">
             {activeView === 'dms' ? (
-              <motion.div key="dms" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex flex-col items-center gap-2 w-full px-2">
-                {onlineContacts.map(c => (
-                  <AvatarWithRotatingName key={c.id} contact={c} isActive={activeChat?.id === c.id} onClick={() => setActiveChat(c)} onDoubleClick={() => setShowProfile(c)} initials={initials} />
-                ))}
-                {offlineContacts.map(c => (
-                  <AvatarWithRotatingName key={c.id} contact={c} isActive={activeChat?.id === c.id} onClick={() => setActiveChat(c)} onDoubleClick={() => setShowProfile(c)} initials={initials} offline />
-                ))}
+              <motion.div key="dms" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-1">
+                {onlineContacts.length === 0 && offlineContacts.length === 0 ? (
+                  <div className="text-center py-8 text-gray-500 text-sm">
+                    Нет контактов
+                  </div>
+                ) : (
+                  <>
+                    {onlineContacts.map(c => (
+                      <button
+                        key={c.id}
+                        onClick={() => setActiveChat(c)}
+                        className={`w-full flex items-center gap-3 p-2 rounded-lg transition-colors ${activeChat?.id === c.id ? 'bg-[#1a1a24]' : 'hover:bg-[#1a1a24]/50'}`}
+                      >
+                        <div className="relative">
+                          <Avatar className="w-9 h-9">
+                            <AvatarFallback className="bg-gradient-to-br from-purple-500 to-pink-500 text-white text-sm">
+                              {initials(c.displayName, c.username)}
+                            </AvatarFallback>
+                          </Avatar>
+                          <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-green-500 rounded-full border-2 border-[#0f0f14]" />
+                        </div>
+                        <div className="flex-1 text-left min-w-0">
+                          <p className="text-white text-sm font-medium truncate">{c.displayName || c.username}</p>
+                          <p className="text-xs text-gray-500 truncate">{c.lastMessage?.content || 'Нет сообщений'}</p>
+                        </div>
+                        {(c.unreadCount || 0) > 0 && (
+                          <span className="bg-purple-500 text-white text-xs px-1.5 py-0.5 rounded-full min-w-[18px] text-center">
+                            {c.unreadCount}
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                    {offlineContacts.map(c => (
+                      <button
+                        key={c.id}
+                        onClick={() => setActiveChat(c)}
+                        className={`w-full flex items-center gap-3 p-2 rounded-lg transition-colors ${activeChat?.id === c.id ? 'bg-[#1a1a24]' : 'hover:bg-[#1a1a24]/50'}`}
+                      >
+                        <Avatar className="w-9 h-9">
+                          <AvatarFallback className="bg-[#2a2a34] text-white text-sm">
+                            {initials(c.displayName, c.username)}
+                          </AvatarFallback>
+                        </Avatar>
+                        <div className="flex-1 text-left min-w-0">
+                          <p className="text-gray-400 text-sm font-medium truncate">{c.displayName || c.username}</p>
+                          <p className="text-xs text-gray-600 truncate">{c.lastMessage?.content || 'Нет сообщений'}</p>
+                        </div>
+                      </button>
+                    ))}
+                  </>
+                )}
               </motion.div>
             ) : (
-              <motion.div key="channels" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="flex flex-col items-center gap-2 w-full px-2">
-                {(channels || []).map(ch => (
-                  <ChannelButton key={ch.id} channel={ch} isActive={activeChannel?.id === ch.id} onClick={() => setActiveChannel(ch)} />
-                ))}
+              <motion.div key="channels" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="space-y-1">
+                {(channels || []).length === 0 ? (
+                  <div className="text-center py-8 text-gray-500 text-sm">
+                    Нет каналов
+                  </div>
+                ) : (
+                  (channels || []).map(ch => (
+                    <button
+                      key={ch.id}
+                      onClick={() => setActiveChannel(ch)}
+                      className={`w-full flex items-center gap-3 p-2 rounded-lg transition-colors ${activeChannel?.id === ch.id ? 'bg-[#1a1a24]' : 'hover:bg-[#1a1a24]/50'}`}
+                    >
+                      <div className="w-9 h-9 rounded-lg bg-[#242430] flex items-center justify-center text-gray-400">
+                        <Hash className="w-4 h-4" />
+                      </div>
+                      <span className="text-white text-sm font-medium truncate">{ch.name}</span>
+                    </button>
+                  ))
+                )}
               </motion.div>
             )}
           </AnimatePresence>
         </div>
-
-        <div className="relative" ref={userMenuRef}>
-          <motion.button
-            whileHover={{ scale: 1.05 }}
-            whileTap={{ scale: 0.95 }}
+        
+        {/* User */}
+        <div className="p-3 border-t border-white/5">
+          <button
             onClick={() => setShowUserMenu(!showUserMenu)}
-            className="w-12 h-12 rounded-full overflow-hidden"
+            className="w-full flex items-center gap-3 p-2 rounded-lg hover:bg-[#1a1a24] transition-colors"
           >
-            <Avatar className="w-full h-full">
-              <AvatarFallback className="bg-gradient-to-br from-purple-500 to-pink-500 text-white font-medium">
+            <Avatar className="w-9 h-9">
+              <AvatarFallback className="bg-gradient-to-br from-purple-500 to-pink-500 text-white text-sm">
                 {initials(user?.displayName || null, user?.username || '')}
               </AvatarFallback>
             </Avatar>
-          </motion.button>
-
-          <AnimatePresence>
-            {showUserMenu && (
-              <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 10 }} className="absolute bottom-full left-full ml-2 mb-2 w-44 bg-[#1a1a24] rounded-xl border border-white/5 shadow-xl overflow-hidden z-50">
-                <div className="p-3 border-b border-white/5">
-                  <p className="text-white text-sm font-medium">{user?.displayName || user?.username}</p>
-                  <p className="text-gray-500 text-xs">@{user?.username}</p>
-                </div>
-                <div className="p-1">
-                  <button onClick={() => { setShowSettings(true); setShowUserMenu(false); }} className="w-full px-3 py-2 text-left text-gray-300 text-sm hover:bg-white/5 rounded-lg flex items-center gap-2">
-                    <Settings className="w-4 h-4" /> Настройки
-                  </button>
-                  <button onClick={logout} className="w-full px-3 py-2 text-left text-red-400 text-sm hover:bg-red-500/10 rounded-lg flex items-center gap-2">
-                    <LogOut className="w-4 h-4" /> Выйти
-                  </button>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
+            <div className="flex-1 text-left">
+              <p className="text-white text-sm font-medium">{user?.displayName || user?.username}</p>
+              <p className="text-xs text-gray-500">@{user?.username}</p>
+            </div>
+            <Settings className="w-4 h-4 text-gray-500" />
+          </button>
+          
+          {showUserMenu && (
+            <div className="absolute bottom-16 left-2 w-52 bg-[#1a1a24] rounded-xl border border-white/5 shadow-xl overflow-hidden z-50">
+              <button onClick={() => { setShowSettings(true); setShowUserMenu(false); }} className="w-full px-4 py-2.5 text-left text-gray-300 text-sm hover:bg-white/5 flex items-center gap-2">
+                <Settings className="w-4 h-4" /> Настройки
+              </button>
+              <button onClick={logout} className="w-full px-4 py-2.5 text-left text-red-400 text-sm hover:bg-red-500/10 flex items-center gap-2">
+                <LogOut className="w-4 h-4" /> Выйти
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -917,65 +1009,7 @@ export function MessengerApp() {
         {/* Messages */}
         <div ref={scrollRef} className="flex-1 overflow-y-auto pb-16 sm:pb-0">
           {!activeTarget ? (
-            <>
-              {/* Mobile contact list */}
-              <div className="sm:hidden p-4">
-                <h2 className="text-white font-semibold mb-4">Сообщения</h2>
-                {onlineContacts.length === 0 && offlineContacts.length === 0 ? (
-                  <div className="text-center py-8">
-                    <Sparkles className="w-12 h-12 text-purple-400 mx-auto mb-3" />
-                    <p className="text-gray-400">Нет контактов</p>
-                    <button 
-                      onClick={() => setShowAddModal(true)}
-                      className="mt-4 px-4 py-2 bg-purple-500 text-white rounded-lg text-sm"
-                    >
-                      Добавить друга
-                    </button>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    {onlineContacts.map(c => (
-                      <button
-                        key={c.id}
-                        onClick={() => setActiveChat(c)}
-                        className="w-full flex items-center gap-3 p-3 rounded-xl bg-[#1a1a24] hover:bg-[#242430] transition-colors"
-                      >
-                        <Avatar className="w-10 h-10">
-                          <AvatarFallback className="bg-gradient-to-br from-purple-500 to-pink-500 text-white">
-                            {initials(c.displayName, c.username)}
-                          </AvatarFallback>
-                        </Avatar>
-                        <div className="flex-1 text-left">
-                          <p className="text-white font-medium">{c.displayName || c.username}</p>
-                          <p className="text-xs text-green-400">онлайн</p>
-                        </div>
-                      </button>
-                    ))}
-                    {offlineContacts.map(c => (
-                      <button
-                        key={c.id}
-                        onClick={() => setActiveChat(c)}
-                        className="w-full flex items-center gap-3 p-3 rounded-xl bg-[#1a1a24] hover:bg-[#242430] transition-colors"
-                      >
-                        <Avatar className="w-10 h-10">
-                          <AvatarFallback className="bg-[#2a2a34] text-white">
-                            {initials(c.displayName, c.username)}
-                          </AvatarFallback>
-                        </Avatar>
-                        <div className="flex-1 text-left">
-                          <p className="text-white font-medium">{c.displayName || c.username}</p>
-                          <p className="text-xs text-gray-500">был(а) недавно</p>
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-              {/* Desktop Welcome Screen */}
-              <div className="hidden sm:block">
-                <WelcomeScreen />
-              </div>
-            </>
+            <WelcomeScreen />
           ) : isLoading ? (
             <div className="flex justify-center py-8">
               <motion.div 
@@ -1217,14 +1251,18 @@ export function MessengerApp() {
                   } else if (activeChat) {
                     sendTyping(activeChat.id, false);
                   }
-                }} placeholder={activeTarget ? `Написать ${activeTarget.displayName || activeTarget.username}...` : 'Сообщение...'} className="flex-1 bg-[#242430] text-white placeholder-gray-500 rounded-xl px-4 py-2.5 outline-none text-sm focus:ring-2 focus:ring-purple-500/50 min-w-0" />
+                }} placeholder={activeTarget ? `Написать ${activeTarget.displayName || activeTarget.username}...` : 'Сообщение...'} className="flex-1 bg-[#242430] text-white placeholder-gray-500 rounded-xl px-4 py-2.5 outline-none text-sm focus:ring-2 focus:ring-purple-500/50 min-w-0" disabled={isSending} />
 
                 {newMessage.trim() || attachments.length > 0 ? (
-                  <button type="submit" className="w-10 h-10 rounded-full bg-purple-500 hover:bg-purple-600 flex items-center justify-center text-white shrink-0 transition-colors">
-                    <Send className="w-4 h-4" />
+                  <button type="submit" disabled={isSending} className="w-10 h-10 rounded-full bg-purple-500 hover:bg-purple-600 flex items-center justify-center text-white shrink-0 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                    {isSending ? (
+                      <motion.div animate={{ rotate: 360 }} transition={{ duration: 1, repeat: Infinity, ease: "linear" }} className="w-4 h-4 border-2 border-white border-t-transparent rounded-full" />
+                    ) : (
+                      <Send className="w-4 h-4" />
+                    )}
                   </button>
                 ) : (
-                  <button type="button" onClick={startRecording} className="w-10 h-10 rounded-full bg-[#242430] hover:bg-[#2a2a34] flex items-center justify-center text-gray-400 hover:text-white shrink-0 transition-colors">
+                  <button type="button" onClick={startRecording} disabled={isSending} className="w-10 h-10 rounded-full bg-[#242430] hover:bg-[#2a2a34] flex items-center justify-center text-gray-400 hover:text-white shrink-0 transition-colors disabled:opacity-50">
                     <Mic className="w-5 h-5" />
                   </button>
                 )}

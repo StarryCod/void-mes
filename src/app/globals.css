@@ -120,3 +120,111 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Custom slider/range input styles */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  width: 100%;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  background: rgba(168, 85, 247, 0.2);
+  height: 4px;
+  border-radius: 4px;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  background: linear-gradient(135deg, #a855f7, #ec4899);
+  height: 14px;
+  width: 14px;
+  border-radius: 50%;
+  margin-top: -5px;
+  box-shadow: 0 2px 6px rgba(168, 85, 247, 0.4);
+  transition: transform 0.15s ease;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+
+input[type="range"]::-moz-range-track {
+  background: rgba(168, 85, 247, 0.2);
+  height: 4px;
+  border-radius: 4px;
+}
+
+input[type="range"]::-moz-range-thumb {
+  background: linear-gradient(135deg, #a855f7, #ec4899);
+  height: 14px;
+  width: 14px;
+  border-radius: 50%;
+  border: none;
+  box-shadow: 0 2px 6px rgba(168, 85, 247, 0.4);
+  transition: transform 0.15s ease;
+}
+
+input[type="range"]::-moz-range-thumb:hover {
+  transform: scale(1.15);
+}
+
+/* Progress bar for voice messages */
+.voice-progress-bar {
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.voice-progress-bar::-webkit-slider-runnable-track {
+  background: rgba(168, 85, 247, 0.3);
+  height: 4px;
+  border-radius: 4px;
+}
+
+.voice-progress-bar::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  background: #a855f7;
+  height: 12px;
+  width: 12px;
+  border-radius: 50%;
+  margin-top: -4px;
+  box-shadow: 0 0 8px rgba(168, 85, 247, 0.5);
+}
+
+/* Mobile touch improvements */
+@media (max-width: 640px) {
+  input[type="range"]::-webkit-slider-thumb {
+    height: 18px;
+    width: 18px;
+    margin-top: -7px;
+  }
+  
+  input[type="range"]::-moz-range-thumb {
+    height: 18px;
+    width: 18px;
+  }
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(168, 85, 247, 0.3);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(168, 85, 247, 0.5);
+}
