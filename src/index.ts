@@ -336,16 +336,31 @@ app.get('/ws/user/:userId', async function(c) {
   
   const id = c.env.CHAT_ROOM.idFromName(roomId);
   const room = c.env.CHAT_ROOM.get(id);
-  return room.fetch(c.req.raw);
+  
+  // Add userId to query params for Durable Object
+  const url = new URL(c.req.url);
+  url.searchParams.set('userId', userId);
+  const modifiedRequest = new Request(url.toString(), c.req.raw);
+  
+  return room.fetch(modifiedRequest);
 });
 
 app.get('/ws/channel/:channelId', async function(c) {
   const channelId = c.req.param('channelId');
+  const userId = c.req.query('userId');
   const roomId = 'channel-' + channelId;
   
   const id = c.env.CHAT_ROOM.idFromName(roomId);
   const room = c.env.CHAT_ROOM.get(id);
-  return room.fetch(c.req.raw);
+  
+  // Add userId to query params for Durable Object
+  const url = new URL(c.req.url);
+  if (userId) {
+    url.searchParams.set('userId', userId);
+  }
+  const modifiedRequest = new Request(url.toString(), c.req.raw);
+  
+  return room.fetch(modifiedRequest);
 });
 
 app.get('/ws/call/:callId', async function(c) {
