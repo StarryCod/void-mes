@@ -1,9 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { writeFileSync, mkdirSync, existsSync } from 'fs';
-import { join } from 'path';
-import { randomUUID } from 'crypto';
 import { checkRateLimit, getClientIp, addSecurityHeaders } from '@/lib/security';
 import { db } from '@/lib/db';
+import { createAppwriteClient, ID } from '@/lib/appwrite/server';
 
 export async function POST(request: NextRequest) {
   try {
@@ -48,23 +46,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Файл слишком большой (макс 10MB)' }, { status: 400 });
     }
 
-    // Generate unique filename
-    const ext = file.name.split('.').pop()?.toLowerCase() || 'bin';
-    const filename = `${randomUUID()}-${Date.now()}.${ext}`;
-    
-    // Ensure upload directory exists
-    const uploadDir = join(process.cwd(), 'public', 'uploads');
-    if (!existsSync(uploadDir)) {
-      mkdirSync(uploadDir, { recursive: true });
-    }
-
-    // Write file
-    const filepath = join(uploadDir, filename);
-    const bytes = await file.arrayBuffer();
-    const buffer = Buffer.from(bytes);
-    writeFileSync(filepath, buffer);
-
     // Determine file type
+    const ext = file.name.split('.').pop()?.toLowerCase() || 'bin';
     let type = 'file';
     if (file.type.startsWith('image/')) type = 'image';
     else if (file.type.startsWith('video/')) type = 'video';
@@ -75,16 +58,40 @@ export async function POST(request: NextRequest) {
       type = 'audio';
     }
 
-    console.log(`[Upload] File saved: ${filename}, type: ${type}, size: ${file.size}`);
+    // Upload to Appwrite Storage
+    try {
+      const { storage } = createAppwriteClient();
+      
+      // Generate unique filename
+      const filename = `${Date.now()}-${file.name}`;
+      
+      // Create file in Appwrite Storage (bucket: uploads)
+      const result = await storage.createFile(
+        'uploads',
+        ID.unique(),
+        file
+      );
 
-    const response = NextResponse.json({
-      url: `/uploads/${filename}`,
-      type,
-      name: file.name,
-      size: file.size,
-    });
-    
-    return addSecurityHeaders(response);
+      // Get the file URL
+      const endpoint = process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT || 'https://fra.cloud.appwrite.io/v1';
+      const projectId = process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID || '69923291001c25654226';
+      const fileUrl = `${endpoint}/storage/buckets/uploads/files/${result.$id}/view?project=${projectId}`;
+
+      console.log(`[Upload] File uploaded to Appwrite: ${result.$id}, type: ${type}, size: ${file.size}`);
+
+      const response = NextResponse.json({
+        url: fileUrl,
+        fileId: result.$id,
+        type,
+        name: file.name,
+        size: file.size,
+      });
+      
+      return addSecurityHeaders(response);
+    } catch (appwriteError) {
+      console.error('[Upload] Appwrite error:', appwriteError);
+      return NextResponse.json({ error: 'Ошибка при загрузке файла в хранилище' }, { status: 500 });
+    }
   } catch (error) {
     console.error('Upload error:', error);
     return NextResponse.json({ error: 'Ошибка при загрузке файла' }, { status: 500 });
