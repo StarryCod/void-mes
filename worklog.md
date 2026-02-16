@@ -24,3 +24,22 @@ Stage Summary:
 - Error "user unavailable" no longer shown to user, only logged
 
 ---
+Task ID: 2
+Agent: Main Agent
+Task: Restore old mobile UI and fix attachments display
+
+Work Log:
+- Fixed API messages - attachments now properly saved to database via Prisma nested create
+- Removed mobile bottom navigation (was added incorrectly)
+- Restored original mobile design: sidebar shows when no active chat, chat shows when selected
+- Fixed pb-16/pb-20 padding issues (removed extra padding since no bottom nav)
+- Switched Prisma from PostgreSQL to SQLite for local development (DATABASE_URL not set locally)
+- Verified realtime server is running on port 3005
+
+Stage Summary:
+- Attachments (images, files, voice messages) now save to database properly
+- Mobile UI returned to original design with proper sidebar/chat switching
+- No more fixed bottom navigation
+- Local development now uses SQLite instead of requiring PostgreSQL connection
+
+---

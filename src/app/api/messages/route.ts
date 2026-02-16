@@ -98,7 +98,7 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { receiverId, channelId, content, replyToId, isVoice, voiceDuration, voiceUrl, attachments } = body;
 
-    // Create message
+    // Create message with attachments
     const message = await db.message.create({
       data: {
         content: content || '',
@@ -110,6 +110,18 @@ export async function POST(request: NextRequest) {
         isVoice: isVoice || false,
         voiceDuration: voiceDuration || null,
         voiceUrl: voiceUrl || null,
+        // Create attachments in database
+        attachments: attachments && attachments.length > 0 ? {
+          create: attachments.map((att: any) => ({
+            url: att.url,
+            type: att.type,
+            name: att.name,
+            size: att.size || 0,
+          }))
+        } : undefined,
+      },
+      include: {
+        attachments: true,
       }
     });
 
@@ -126,7 +138,7 @@ export async function POST(request: NextRequest) {
         isVoice: message.isVoice,
         voiceDuration: message.voiceDuration,
         voiceUrl: message.voiceUrl,
-        attachments: attachments || [],
+        attachments: message.attachments || [],
       },
     });
   } catch (error) {

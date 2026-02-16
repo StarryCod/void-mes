@@ -774,8 +774,8 @@ export function MessengerApp() {
 
   return (
     <div className="fixed inset-0 flex bg-[#13131a] overflow-hidden">
-      {/* LEFT SIDEBAR - Desktop only, shows names */}
-      <div className="w-60 bg-[#0f0f14] flex flex-col border-r border-white/5 shrink-0 hidden md:flex">
+      {/* LEFT SIDEBAR - Shows on mobile when no active chat, always on desktop */}
+      <div className={`${activeTarget ? 'hidden md:flex' : 'flex'} w-full md:w-60 bg-[#0f0f14] flex-col border-r border-white/5 shrink-0`}>
         {/* Header */}
         <div className="h-14 px-4 flex items-center justify-between border-b border-white/5">
           <h1 className="text-white font-bold text-lg">Void Mes</h1>
@@ -915,8 +915,8 @@ export function MessengerApp() {
         </div>
       </div>
 
-      {/* CHAT WINDOW */}
-      <div className="flex-1 flex flex-col bg-[#13131a] min-w-0 h-full">
+      {/* CHAT WINDOW - Shows only when there's an active chat */}
+      <div className={`${activeTarget ? 'flex' : 'hidden md:flex'} flex-1 flex-col bg-[#13131a] min-w-0 h-full`}>
         {activeTarget ? (
           <div className="h-14 px-4 flex items-center gap-3 border-b border-white/5 bg-[#1a1a24] shrink-0">
             {/* Back button for mobile */}
@@ -1007,7 +1007,7 @@ export function MessengerApp() {
         ) : null}
 
         {/* Messages */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto pb-16 sm:pb-0">
+        <div ref={scrollRef} className="flex-1 overflow-y-auto">
           {!activeTarget ? (
             <WelcomeScreen />
           ) : isLoading ? (
@@ -1022,7 +1022,7 @@ export function MessengerApp() {
             <motion.div 
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
-              className="flex flex-col items-center justify-center h-full text-center pb-20 sm:pb-0"
+              className="flex flex-col items-center justify-center h-full text-center"
             >
               <motion.div 
                 animate={{ scale: [1, 1.1, 1], rotate: [0, 5, -5, 0] }}
@@ -1206,7 +1206,7 @@ export function MessengerApp() {
 
         {/* Input */}
         {activeTarget && (
-          <div className="p-4 bg-[#1a1a24] border-t border-white/5 pb-20 sm:pb-4">
+          <div className="p-4 bg-[#1a1a24] border-t border-white/5">
             {isRecording ? (
               <div className="flex items-center gap-3 bg-[#242430] rounded-xl px-4 py-3">
                 <motion.div animate={{ scale: [1, 1.2, 1] }} transition={{ duration: 1, repeat: Infinity }} className="w-3 h-3 bg-red-500 rounded-full" />
@@ -1480,29 +1480,7 @@ export function MessengerApp() {
         )}
       </AnimatePresence>
 
-      {/* Mobile Bottom Navigation */}
-      <div className="fixed bottom-0 left-0 right-0 h-16 bg-[#0f0f14] border-t border-white/5 flex items-center justify-around sm:hidden z-40">
-        <button 
-          onClick={() => { setActiveView('dms'); setActiveChat(null); setActiveChannel(null); }}
-          className={`flex flex-col items-center gap-1 ${activeView === 'dms' ? 'text-purple-400' : 'text-gray-500'}`}
-        >
-          <MessageSquare className="w-5 h-5" />
-          <span className="text-[10px]">Чаты</span>
-        </button>
-        <button 
-          onClick={() => { setShowAddModal(true); }}
-          className="w-12 h-12 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-white -mt-4 shadow-lg shadow-purple-500/20"
-        >
-          <Plus className="w-6 h-6" />
-        </button>
-        <button 
-          onClick={() => { setActiveView('channels'); setActiveChat(null); setActiveChannel(null); }}
-          className={`flex flex-col items-center gap-1 ${activeView === 'channels' ? 'text-purple-400' : 'text-gray-500'}`}
-        >
-          <Hash className="w-5 h-5" />
-          <span className="text-[10px]">Каналы</span>
-        </button>
-      </div>
+      {/* No Mobile Bottom Navigation - using sidebar instead */}
 
       {/* Call Manager - WebRTC */}
       {user && (
