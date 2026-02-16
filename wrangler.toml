@@ -2,6 +2,16 @@ name = "void-realtime"
 main = "src/index.ts"
 compatibility_date = "2024-12-30"
 
+# Environment Variables (set via wrangler secret or .dev.vars)
+# Required secrets:
+#   - DATABASE_URL: Neon PostgreSQL connection string
+#   - APPWRITE_ENDPOINT: Appwrite API endpoint URL
+#   - APPWRITE_PROJECT_ID: Appwrite project ID
+#   - APPWRITE_API_KEY: Appwrite API key for server-side operations
+#
+# For local development: copy .dev.vars.example to .dev.vars
+# For production: use `wrangler secret put <NAME>`
+
 # Durable Objects binding
 [[durable_objects.bindings]]
 name = "CHAT_ROOM"

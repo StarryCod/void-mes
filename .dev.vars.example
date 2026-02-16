@@ -1,0 +1,11 @@
+# Cloudflare Workers Environment Variables
+# Copy this file to .dev.vars and fill in your values
+# .dev.vars is used for local development with wrangler dev
+
+# Neon PostgreSQL Database URL (required)
+DATABASE_URL=postgresql://user:password@host:5432/database?sslmode=require
+
+# Appwrite Configuration (required for file storage)
+APPWRITE_ENDPOINT=https://fra.cloud.appwrite.io/v1
+APPWRITE_PROJECT_ID=your-project-id
+APPWRITE_API_KEY=your-appwrite-api-key
