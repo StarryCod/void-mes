@@ -64,3 +64,29 @@ Architecture:
 - When Appwrite event received → frontend fetches from Neon
 
 ---
+Task ID: 4
+Agent: Main Agent
+Task: Discord-style UI, Appwrite Realtime with encryption
+
+Work Log:
+- Complete Discord-style UI redesign:
+  - Server bar on left (desktop)
+  - Sidebar with contacts/channels
+  - User panel at bottom
+  - Discord color palette (#313338, #2b2d31, #5865f2)
+- Created encryption.ts for client-side XOR encryption
+- Created appwrite-messages.ts service:
+  - Full Appwrite Database integration
+  - Realtime subscriptions
+  - File uploads
+  - Proper permissions per user
+- Added fallback Appwrite credentials for local dev
+- Removed old polling completely
+
+Architecture:
+- Messages stored in Appwrite Database (encrypted)
+- Appwrite Realtime for live updates
+- Client-side encryption before sending
+- Permissions: sender + receiver can read
+
+---
