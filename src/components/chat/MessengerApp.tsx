@@ -231,6 +231,17 @@ export function MessengerApp() {
     if (activeTarget && token) fetchMessages();
   }, [activeTarget?.id, token]);
 
+  // Polling for messages every 500ms when chat is active (fallback for realtime)
+  useEffect(() => {
+    if (!activeTarget || !token) return;
+    
+    const pollInterval = setInterval(() => {
+      fetchMessages();
+    }, 500);
+    
+    return () => clearInterval(pollInterval);
+  }, [activeTarget?.id, token]);
+
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -731,9 +742,9 @@ export function MessengerApp() {
   if (!user) return <AuthForm onSuccess={() => {}} />;
 
   return (
-    <div className="h-screen flex bg-[#13131a] overflow-hidden">
+    <div className="fixed inset-0 flex bg-[#13131a] overflow-hidden">
       {/* LEFT SIDEBAR */}
-      <div className="w-20 bg-[#0f0f14] flex flex-col items-center py-3 gap-2 border-r border-white/5 shrink-0">
+      <div className="w-20 bg-[#0f0f14] flex flex-col items-center py-3 gap-2 border-r border-white/5 shrink-0 hidden sm:flex">
         <motion.button
           whileHover={{ scale: 1.1 }}
           whileTap={{ scale: 0.9 }}
@@ -813,9 +824,19 @@ export function MessengerApp() {
       </div>
 
       {/* CHAT WINDOW */}
-      <div className="flex-1 flex flex-col bg-[#13131a] min-w-0">
+      <div className="flex-1 flex flex-col bg-[#13131a] min-w-0 h-full">
         {activeTarget ? (
           <div className="h-14 px-4 flex items-center gap-3 border-b border-white/5 bg-[#1a1a24] shrink-0">
+            {/* Back button for mobile */}
+            <button 
+              onClick={() => {
+                setActiveChat(null);
+                setActiveChannel(null);
+              }}
+              className="w-9 h-9 rounded-full hover:bg-white/5 flex items-center justify-center text-gray-400 hover:text-white sm:hidden"
+            >
+              <X className="w-5 h-5" />
+            </button>
             {isChannel ? (
               <div className="w-9 h-9 rounded-lg bg-[#242430] flex items-center justify-center text-gray-400">
                 <span className="text-lg">#</span>
@@ -894,9 +915,67 @@ export function MessengerApp() {
         ) : null}
 
         {/* Messages */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto">
+        <div ref={scrollRef} className="flex-1 overflow-y-auto pb-16 sm:pb-0">
           {!activeTarget ? (
-            <WelcomeScreen />
+            <>
+              {/* Mobile contact list */}
+              <div className="sm:hidden p-4">
+                <h2 className="text-white font-semibold mb-4">Сообщения</h2>
+                {onlineContacts.length === 0 && offlineContacts.length === 0 ? (
+                  <div className="text-center py-8">
+                    <Sparkles className="w-12 h-12 text-purple-400 mx-auto mb-3" />
+                    <p className="text-gray-400">Нет контактов</p>
+                    <button 
+                      onClick={() => setShowAddModal(true)}
+                      className="mt-4 px-4 py-2 bg-purple-500 text-white rounded-lg text-sm"
+                    >
+                      Добавить друга
+                    </button>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {onlineContacts.map(c => (
+                      <button
+                        key={c.id}
+                        onClick={() => setActiveChat(c)}
+                        className="w-full flex items-center gap-3 p-3 rounded-xl bg-[#1a1a24] hover:bg-[#242430] transition-colors"
+                      >
+                        <Avatar className="w-10 h-10">
+                          <AvatarFallback className="bg-gradient-to-br from-purple-500 to-pink-500 text-white">
+                            {initials(c.displayName, c.username)}
+                          </AvatarFallback>
+                        </Avatar>
+                        <div className="flex-1 text-left">
+                          <p className="text-white font-medium">{c.displayName || c.username}</p>
+                          <p className="text-xs text-green-400">онлайн</p>
+                        </div>
+                      </button>
+                    ))}
+                    {offlineContacts.map(c => (
+                      <button
+                        key={c.id}
+                        onClick={() => setActiveChat(c)}
+                        className="w-full flex items-center gap-3 p-3 rounded-xl bg-[#1a1a24] hover:bg-[#242430] transition-colors"
+                      >
+                        <Avatar className="w-10 h-10">
+                          <AvatarFallback className="bg-[#2a2a34] text-white">
+                            {initials(c.displayName, c.username)}
+                          </AvatarFallback>
+                        </Avatar>
+                        <div className="flex-1 text-left">
+                          <p className="text-white font-medium">{c.displayName || c.username}</p>
+                          <p className="text-xs text-gray-500">был(а) недавно</p>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {/* Desktop Welcome Screen */}
+              <div className="hidden sm:block">
+                <WelcomeScreen />
+              </div>
+            </>
           ) : isLoading ? (
             <div className="flex justify-center py-8">
               <motion.div 
@@ -909,7 +988,7 @@ export function MessengerApp() {
             <motion.div 
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
-              className="flex flex-col items-center justify-center h-full text-center"
+              className="flex flex-col items-center justify-center h-full text-center pb-20 sm:pb-0"
             >
               <motion.div 
                 animate={{ scale: [1, 1.1, 1], rotate: [0, 5, -5, 0] }}
@@ -922,7 +1001,7 @@ export function MessengerApp() {
               <p className="text-gray-600 text-sm mt-1">Отправьте первое сообщение!</p>
             </motion.div>
           ) : (
-            <div className="px-4 py-4">
+            <div className="px-4 py-4 pb-24 sm:pb-4">
               {groupedMessages.map((group) => (
                 <div key={group.date}>
                   <div className="flex items-center gap-4 my-6">
@@ -1093,7 +1172,7 @@ export function MessengerApp() {
 
         {/* Input */}
         {activeTarget && (
-          <div className="p-4 bg-[#1a1a24] border-t border-white/5">
+          <div className="p-4 bg-[#1a1a24] border-t border-white/5 pb-20 sm:pb-4">
             {isRecording ? (
               <div className="flex items-center gap-3 bg-[#242430] rounded-xl px-4 py-3">
                 <motion.div animate={{ scale: [1, 1.2, 1] }} transition={{ duration: 1, repeat: Infinity }} className="w-3 h-3 bg-red-500 rounded-full" />
@@ -1362,6 +1441,30 @@ export function MessengerApp() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Mobile Bottom Navigation */}
+      <div className="fixed bottom-0 left-0 right-0 h-16 bg-[#0f0f14] border-t border-white/5 flex items-center justify-around sm:hidden z-40">
+        <button 
+          onClick={() => { setActiveView('dms'); setActiveChat(null); setActiveChannel(null); }}
+          className={`flex flex-col items-center gap-1 ${activeView === 'dms' ? 'text-purple-400' : 'text-gray-500'}`}
+        >
+          <MessageSquare className="w-5 h-5" />
+          <span className="text-[10px]">Чаты</span>
+        </button>
+        <button 
+          onClick={() => { setShowAddModal(true); }}
+          className="w-12 h-12 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-white -mt-4 shadow-lg shadow-purple-500/20"
+        >
+          <Plus className="w-6 h-6" />
+        </button>
+        <button 
+          onClick={() => { setActiveView('channels'); setActiveChat(null); setActiveChannel(null); }}
+          className={`flex flex-col items-center gap-1 ${activeView === 'channels' ? 'text-purple-400' : 'text-gray-500'}`}
+        >
+          <Hash className="w-5 h-5" />
+          <span className="text-[10px]">Каналы</span>
+        </button>
+      </div>
 
       {/* Call Manager - WebRTC */}
       {user && (
