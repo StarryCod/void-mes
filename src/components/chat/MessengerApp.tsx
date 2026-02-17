@@ -8,7 +8,7 @@ import { useChatStore, Contact, Channel, Message } from '@/store/chat';
 import { AuthForm } from '@/components/auth/AuthForm';
 import { VoidLogo } from '@/components/common/VoidLogo';
 import { CallManager } from '@/components/call/CallManager';
-import { useWebSocket } from '@/hooks/useWebSocket';
+import { usePolling } from '@/hooks/usePolling';
 import { useToast } from '@/hooks/use-toast';
 import {
   Plus, MessageSquare, Hash, X, Check, LogOut, Settings,
@@ -27,19 +27,9 @@ export function MessengerApp() {
     typingUsers, setTypingUser
   } = useChatStore();
   const { toast } = useToast();
-  const { 
-    sendMessage: wsSendMessage, 
-    sendTyping, 
-    markAsRead, 
-    notifyContactAdded,
-    callUser,
-    answerCall,
-    rejectCall,
-    endCall: wsEndCall,
-    sendIceCandidate,
-    notifyScreenShareStart,
-    notifyScreenShareStop
-  } = useWebSocket();
+  
+  // УМНЫЙ Polling - работает только когда чат открыт!
+  usePolling();
 
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
   
@@ -126,61 +116,7 @@ export function MessengerApp() {
     return () => document.removeEventListener('mousedown', handleClick);
   }, []);
 
-  // Bridge call events from CallManager to Socket
-  useEffect(() => {
-    const handleSocketCall = (e: CustomEvent) => {
-      const { targetId, signal, callType, callerName } = e.detail;
-      callUser(targetId, signal, callType, user?.displayName || user?.username || 'User');
-    };
-
-    const handleSocketAnswer = (e: CustomEvent) => {
-      const { targetId, signal } = e.detail;
-      answerCall(targetId, signal);
-    };
-
-    const handleSocketReject = (e: CustomEvent) => {
-      const { targetId } = e.detail;
-      rejectCall(targetId);
-    };
-
-    const handleSocketEnd = (e: CustomEvent) => {
-      const { targetId } = e.detail;
-      wsEndCall(targetId);
-    };
-
-    const handleSocketIce = (e: CustomEvent) => {
-      const { targetId, candidate } = e.detail;
-      sendIceCandidate(targetId, candidate);
-    };
-
-    const handleSocketScreenStart = (e: CustomEvent) => {
-      const { targetId } = e.detail;
-      notifyScreenShareStart(targetId);
-    };
-
-    const handleSocketScreenStop = (e: CustomEvent) => {
-      const { targetId } = e.detail;
-      notifyScreenShareStop(targetId);
-    };
-
-    window.addEventListener('void-socket-call', handleSocketCall as EventListener);
-    window.addEventListener('void-socket-answer', handleSocketAnswer as EventListener);
-    window.addEventListener('void-socket-reject', handleSocketReject as EventListener);
-    window.addEventListener('void-socket-end', handleSocketEnd as EventListener);
-    window.addEventListener('void-socket-ice', handleSocketIce as EventListener);
-    window.addEventListener('void-socket-screen-start', handleSocketScreenStart as EventListener);
-    window.addEventListener('void-socket-screen-stop', handleSocketScreenStop as EventListener);
-
-    return () => {
-      window.removeEventListener('void-socket-call', handleSocketCall as EventListener);
-      window.removeEventListener('void-socket-answer', handleSocketAnswer as EventListener);
-      window.removeEventListener('void-socket-reject', handleSocketReject as EventListener);
-      window.removeEventListener('void-socket-end', handleSocketEnd as EventListener);
-      window.removeEventListener('void-socket-ice', handleSocketIce as EventListener);
-      window.removeEventListener('void-socket-screen-start', handleSocketScreenStart as EventListener);
-      window.removeEventListener('void-socket-screen-stop', handleSocketScreenStop as EventListener);
-    };
-  }, [user, callUser, answerCall, rejectCall, wsEndCall, sendIceCandidate, notifyScreenShareStart, notifyScreenShareStop]);
+  // CallManager handles WebRTC signaling internally
 
   const checkAuth = useCallback(async () => {
     if (!token) {
@@ -300,11 +236,7 @@ export function MessengerApp() {
         addContact(newContact);
         setSearchResults(r => r.map(x => x.id === u.id ? { ...x, isContact: true } : x));
         
-        // Notify the other user via socket
-        notifyContactAdded(u.id, {
-          username: user?.username,
-          displayName: user?.displayName
-        });
+        // API already notifies the other user
         
         toast({
           title: 'Успешно',
@@ -1213,23 +1145,7 @@ export function MessengerApp() {
                 </div>
 
                 <input ref={fileInputRef} type="file" className="hidden" onChange={onFileChange} />
-                <input type="text" value={newMessage} onChange={e => {
-                  setNewMessage(e.target.value);
-                  // Send typing indicator
-                  if (activeChat && e.target.value.length > 0) {
-                    sendTyping(activeChat.id, true);
-                    // Clear previous timeout
-                    if (typingTimeoutRef.current) {
-                      clearTimeout(typingTimeoutRef.current);
-                    }
-                    // Stop typing indicator after 2 seconds of no input
-                    typingTimeoutRef.current = setTimeout(() => {
-                      sendTyping(activeChat.id, false);
-                    }, 2000);
-                  } else if (activeChat) {
-                    sendTyping(activeChat.id, false);
-                  }
-                }} placeholder={activeTarget ? `Написать ${activeTarget.displayName || activeTarget.username}...` : 'Сообщение...'} className="flex-1 bg-[#242430] text-white placeholder-gray-500 rounded-xl px-4 py-2.5 outline-none text-sm focus:ring-2 focus:ring-purple-500/50 min-w-0" disabled={isSending} />
+                <input type="text" value={newMessage} onChange={e => setNewMessage(e.target.value)} placeholder={activeTarget ? `Написать ${activeTarget.displayName || activeTarget.username}...` : 'Сообщение...'} className="flex-1 bg-[#242430] text-white placeholder-gray-500 rounded-xl px-4 py-2.5 outline-none text-sm focus:ring-2 focus:ring-purple-500/50 min-w-0" disabled={isSending} />
 
                 {newMessage.trim() || attachments.length > 0 ? (
                   <button type="submit" disabled={isSending} className="w-10 h-10 rounded-full bg-purple-500 hover:bg-purple-600 flex items-center justify-center text-white shrink-0 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
