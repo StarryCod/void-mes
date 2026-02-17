@@ -1,6 +1,37 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
-import { createAppwriteClient, DATABASE_ID, COLLECTIONS, ID } from '@/lib/appwrite/server';
+
+// Notify user via Cloudflare Worker WebSocket
+async function notifyUser(userId: string, message: any) {
+  try {
+    const WORKER_URL = process.env.NEXT_PUBLIC_CF_WORKERS_URL || 'https://void-time.mr-starred09.workers.dev';
+    
+    // Get sender info
+    const sender = await db.user.findUnique({
+      where: { id: message.senderId },
+      select: { id: true, username: true, displayName: true, avatar: true }
+    });
+    
+    const fullMessage = { ...message, sender };
+    
+    // Notify via Worker's broadcast endpoint
+    await fetch(`${WORKER_URL}/ws/user/${userId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'message',
+        action: 'new',
+        data: fullMessage,
+        senderId: message.senderId,
+        timestamp: Date.now()
+      })
+    });
+    
+    console.log('[API] WebSocket notification sent to:', userId);
+  } catch (error) {
+    console.error('[API] Failed to send WebSocket notification:', error);
+  }
+}
 
 export async function GET(request: NextRequest) {
   try {
@@ -125,44 +156,41 @@ export async function POST(request: NextRequest) {
       }
     });
 
-    // Create lightweight event in Appwrite for realtime notification
-    try {
-      const { databases } = createAppwriteClient();
-      await databases.createDocument(
-        DATABASE_ID,
-        COLLECTIONS.MESSAGES,
-        ID.unique(),
-        {
-          messageId: message.id,
-          senderId: userId,
-          receiverId: receiverId || '',
-          channelId: channelId || '',
-          type: 'new',
-          timestamp: Date.now(),
-        }
-      );
-      console.log('[Appwrite] Message event created:', message.id);
-    } catch (appwriteError) {
-      // Don't fail the request if Appwrite fails
-      console.error('[Appwrite] Failed to create event (non-critical):', appwriteError);
+    // Prepare message for response
+    const messageResponse = {
+      id: message.id,
+      content: message.content,
+      senderId: message.senderId,
+      receiverId: message.receiverId,
+      channelId: message.channelId,
+      replyToId: message.replyToId,
+      isRead: message.isRead,
+      createdAt: message.createdAt,
+      isVoice: message.isVoice,
+      voiceDuration: message.voiceDuration,
+      voiceUrl: message.voiceUrl,
+      attachments: message.attachments || [],
+    };
+
+    // Notify receiver via WebSocket (non-blocking)
+    if (receiverId) {
+      // Direct message - notify receiver
+      notifyUser(receiverId, messageResponse).catch(console.error);
+    } else if (channelId) {
+      // Channel message - notify all channel members
+      db.channelMember.findMany({
+        where: { channelId },
+        select: { userId: true }
+      }).then(members => {
+        members.forEach(member => {
+          if (member.userId !== userId) {
+            notifyUser(member.userId, { ...messageResponse, channelId }).catch(console.error);
+          }
+        });
+      }).catch(console.error);
     }
 
-    return NextResponse.json({
-      message: {
-        id: message.id,
-        content: message.content,
-        senderId: message.senderId,
-        receiverId: message.receiverId,
-        channelId: message.channelId,
-        replyToId: message.replyToId,
-        isRead: message.isRead,
-        createdAt: message.createdAt,
-        isVoice: message.isVoice,
-        voiceDuration: message.voiceDuration,
-        voiceUrl: message.voiceUrl,
-        attachments: message.attachments || [],
-      },
-    });
+    return NextResponse.json({ message: messageResponse });
   } catch (error) {
     console.error('Create message error:', error);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
