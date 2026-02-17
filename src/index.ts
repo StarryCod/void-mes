@@ -60,6 +60,24 @@ async function verifyUser(request: Request, env: Env): Promise<string | null> {
   return session.userId;
 }
 
+// Notify user via WebSocket
+async function notifyUser(env: Env, userId: string, message: any): Promise<void> {
+  try {
+    const roomId = 'user-' + userId;
+    const id = env.CHAT_ROOM.idFromName(roomId);
+    const room = env.CHAT_ROOM.get(id);
+    
+    // Send notification to the room via HTTP
+    await room.fetch(new Request('https://internal/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(message)
+    }));
+  } catch (e) {
+    console.error('Failed to notify user:', e);
+  }
+}
+
 // Create Hono app
 const app = new Hono<{ Bindings: Env }>();
 
@@ -75,7 +93,7 @@ app.get('/', function(c) {
   return c.json({ 
     status: 'ok', 
     service: 'void-realtime',
-    version: '1.0.0'
+    version: '2.0.0'
   });
 });
 
@@ -164,6 +182,21 @@ app.post('/api/contacts', async function(c) {
     FROM "User" WHERE id = ${contactId}
   `;
   
+  // Notify the contact that they were added
+  const senderInfo = await sql`
+    SELECT id, username, "displayName", avatar, bio, status
+    FROM "User" WHERE id = ${userId}
+  `;
+  
+  if (senderInfo[0]) {
+    await notifyUser(c.env, contactId, {
+      type: 'contact',
+      action: 'new',
+      data: senderInfo[0],
+      timestamp: Date.now()
+    });
+  }
+  
   return jsonResponse({ success: true, contact: contactInfo[0] });
 });
 
@@ -247,6 +280,35 @@ app.post('/api/messages', async function(c) {
   `;
   
   const fullMessage = { ...message, sender: senderResult[0] };
+  
+  // Notify receiver via WebSocket
+  if (receiverId) {
+    await notifyUser(c.env, receiverId, {
+      type: 'message',
+      action: 'new',
+      data: fullMessage,
+      senderId: userId,
+      timestamp: Date.now()
+    });
+  }
+  
+  // For channels - notify all channel members
+  if (channelId) {
+    const members = await sql`
+      SELECT "userId" FROM "ChannelMember" WHERE "channelId" = ${channelId}
+    `;
+    for (const member of members) {
+      if (member.userId !== userId) {
+        await notifyUser(c.env, member.userId, {
+          type: 'message',
+          action: 'new',
+          data: { ...fullMessage, channelId },
+          senderId: userId,
+          timestamp: Date.now()
+        });
+      }
+    }
+  }
   
   return jsonResponse(fullMessage);
 });
