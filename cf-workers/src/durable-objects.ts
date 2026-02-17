@@ -1,5 +1,5 @@
-import { DurableObject, DurableObjectState, Request } from '@cloudflare/workers-types';
-import { Env, Message, getDb, corsHeaders } from './types';
+import { DurableObject } from 'cloudflare:workers';
+import { Env, corsHeaders } from './types';
 
 interface WebSocketWithMetadata {
   websocket: WebSocket;
@@ -8,7 +8,7 @@ interface WebSocketWithMetadata {
 }
 
 interface ChatMessage {
-  type: 'message' | 'typing' | 'read' | 'presence' | 'contact' | 'call';
+  type: 'message' | 'typing' | 'read' | 'presence' | 'contact' | 'call' | 'ping';
   action: string;
   data: any;
   senderId?: string;
@@ -17,15 +17,11 @@ interface ChatMessage {
 
 // ChatRoom Durable Object - handles WebSocket connections for a specific room
 export class ChatRoom extends DurableObject {
-  private state: DurableObjectState;
-  private env: Env;
   private sessions: Map<WebSocket, WebSocketWithMetadata> = new Map();
   private lastActivity: number = Date.now();
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    this.state = state;
-    this.env = env;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -128,8 +124,12 @@ export class ChatRoom extends DurableObject {
     
     switch (msg.type) {
       case 'message':
-        // Broadcast message to all in room
-        await this.broadcast(msg);
+        // Don't broadcast 'send' action - it's handled by API
+        // Only broadcast if it's already a 'new' message from API
+        if (msg.action === 'new') {
+          await this.broadcast(msg, sender);
+        }
+        // Ignore 'send' action - messages are sent via REST API
         break;
         
       case 'typing':
@@ -152,6 +152,11 @@ export class ChatRoom extends DurableObject {
         await this.broadcast(msg, sender);
         break;
         
+      case 'ping':
+        // Respond with pong
+        sender.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+        break;
+        
       default:
         console.log('Unknown message type:', msg.type);
     }
@@ -170,15 +175,11 @@ export class ChatRoom extends DurableObject {
 
 // CallRoom Durable Object - handles WebRTC signaling
 export class CallRoom extends DurableObject {
-  private state: DurableObjectState;
-  private env: Env;
   private participants: Map<string, WebSocket> = new Map();
   private callState: 'idle' | 'ringing' | 'connected' = 'idle';
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
-    this.state = state;
-    this.env = env;
   }
 
   async fetch(request: Request): Promise<Response> {
