@@ -26,6 +26,8 @@ export function useWebSocket() {
   // Handle incoming messages - defined first to avoid hoisting issues
   const handleMessage = useCallback((msg: any) => {
     const { type, action, data, senderId } = msg;
+    
+    console.log('[WebSocket] 📨 Received:', type, action, { data, senderId });
 
     switch (type) {
       case 'message':
@@ -35,9 +37,18 @@ export function useWebSocket() {
           const currentChat = useChatStore.getState().activeChat;
           const messageData = data?.senderId ? data : { ...data, senderId };
           
+          console.log('[WebSocket] 🔍 Debug:', {
+            currentChatId: currentChat?.id,
+            messageSenderId: messageData.senderId,
+            willAdd: currentChat && messageData.senderId === currentChat.id
+          });
+          
           // Add message if chat is open with sender
           if (currentChat && messageData.senderId === currentChat.id) {
+            console.log('[WebSocket] ✅ Adding message to UI');
             useChatStore.getState().addMessage(messageData);
+          } else {
+            console.log('[WebSocket] ⚠️ Message not added - chat not open or different sender');
           }
           
           // Update contact list
