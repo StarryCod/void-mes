@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { Env, getDb, verifyUser, jsonResponse, errorResponse, handleCors, corsHeaders } from './types';
+import { Env, getDb, verifyUser, jsonResponse, errorResponse, corsHeaders } from './types';
 import { ChatRoom, CallRoom } from './durable-objects';
 
 // Export Durable Objects
@@ -16,9 +16,70 @@ app.use('*', cors({
   allowHeaders: ['Content-Type', 'Authorization'],
 }));
 
+// ==================== SSE SUBSCRIBE ====================
+
+/**
+ * SSE endpoint for real-time updates
+ * Client sends POST with token, we verify and return SSE stream
+ */
+app.post('/sse/subscribe', async (c) => {
+  const userId = await verifyUser(c.req.raw, c.env);
+  if (!userId) {
+    return errorResponse('Unauthorized', 401);
+  }
+  
+  const body = await c.req.json() as { sessionId?: string };
+  const sessionId = body.sessionId || `session-${userId}-${Date.now()}`;
+  
+  // Get user's ChatRoom Durable Object
+  const roomId = `user-${userId}`;
+  const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
+  
+  // Forward to Durable Object which returns SSE stream
+  const response = await room.fetch(new Request('https://internal/subscribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ userId, sessionId })
+  }));
+  
+  return response;
+});
+
+/**
+ * Unsubscribe from SSE
+ */
+app.post('/sse/unsubscribe', async (c) => {
+  const userId = await verifyUser(c.req.raw, c.env);
+  if (!userId) {
+    return errorResponse('Unauthorized', 401);
+  }
+  
+  const body = await c.req.json() as { sessionId: string };
+  const roomId = `user-${userId}`;
+  const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
+  
+  await room.fetch(new Request('https://internal/unsubscribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }));
+  
+  return jsonResponse({ success: true });
+});
+
+/**
+ * Get online users
+ */
+app.get('/sse/online/:userId', async (c) => {
+  const userId = c.req.param('userId');
+  const roomId = `user-${userId}`;
+  const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
+  
+  return room.fetch(new Request('https://internal/online'));
+});
+
 // ==================== AUTH ====================
 
-// Verify token and get user
 app.get('/api/auth/me', async (c) => {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
@@ -35,7 +96,6 @@ app.get('/api/auth/me', async (c) => {
     return errorResponse('User not found', 404);
   }
   
-  // Update online status
   await sql`
     UPDATE "User" SET "isOnline" = true, "lastSeen" = NOW()
     WHERE id = ${userId}
@@ -46,7 +106,6 @@ app.get('/api/auth/me', async (c) => {
 
 // ==================== CONTACTS ====================
 
-// Get contacts
 app.get('/api/contacts', async (c) => {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
@@ -67,7 +126,6 @@ app.get('/api/contacts', async (c) => {
   return jsonResponse(contacts);
 });
 
-// Add contact
 app.post('/api/contacts', async (c) => {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
@@ -82,7 +140,6 @@ app.post('/api/contacts', async (c) => {
   
   const sql = getDb(c.env);
   
-  // Check if already contacts
   const existing = await sql`
     SELECT id FROM "Contact" 
     WHERE "userId" = ${userId} AND "contactId" = ${contactId}
@@ -92,7 +149,6 @@ app.post('/api/contacts', async (c) => {
     return errorResponse('Already in contacts');
   }
   
-  // Add both ways (mutual contacts)
   await sql`
     INSERT INTO "Contact" ("id", "userId", "contactId", "createdAt")
     VALUES (gen_random_uuid(), ${userId}, ${contactId}, NOW())
@@ -103,35 +159,22 @@ app.post('/api/contacts', async (c) => {
     VALUES (gen_random_uuid(), ${contactId}, ${userId}, NOW())
   `;
   
-  // Get contact info
   const contactInfo = await sql`
     SELECT id, username, "displayName", avatar, bio, status, "isOnline", "lastSeen"
     FROM "User" WHERE id = ${contactId}
   `;
   
-  // Notify via WebSocket
-  const roomId = `user-${contactId}`;
-  const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-  await room.fetch(new Request('https://internal/broadcast', {
-    method: 'POST',
-    body: JSON.stringify({
-      type: 'contact',
-      action: 'new',
-      data: {
-        id: userId,
-        ...contactInfo[0],
-      },
-      senderId: userId,
-      timestamp: Date.now(),
-    }),
-  }));
+  // Notify via SSE
+  await broadcastToUser(c.env, contactId, 'contact', {
+    id: userId,
+    ...contactInfo[0],
+  });
   
   return jsonResponse({ success: true, contact: contactInfo[0] });
 });
 
 // ==================== MESSAGES ====================
 
-// Get messages
 app.get('/api/messages', async (c) => {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
@@ -172,7 +215,6 @@ app.get('/api/messages', async (c) => {
   return jsonResponse(messages);
 });
 
-// Send message
 app.post('/api/messages', async (c) => {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
@@ -199,42 +241,23 @@ app.post('/api/messages', async (c) => {
     RETURNING *
   `;
   
-  // Get sender info
   const [sender] = await sql`
     SELECT id, username, "displayName", avatar FROM "User" WHERE id = ${userId}
   `;
   
   const fullMessage = { ...message, sender };
   
-  // Notify via WebSocket
+  // Notify via SSE - simple and reliable!
   if (receiverId) {
-    // Direct message - notify receiver
-    const roomId = `user-${receiverId}`;
-    const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-    await room.fetch(new Request('https://internal/broadcast', {
-      method: 'POST',
-      body: JSON.stringify({
-        type: 'message',
-        action: 'new',
-        data: fullMessage,
-        senderId: userId,
-        timestamp: Date.now(),
-      }),
-    }));
+    await broadcastToUser(c.env, receiverId, 'message', fullMessage);
   } else if (channelId) {
-    // Channel message - notify all in channel
-    const roomId = `channel-${channelId}`;
-    const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-    await room.fetch(new Request('https://internal/broadcast', {
-      method: 'POST',
-      body: JSON.stringify({
-        type: 'message',
-        action: 'new',
-        data: fullMessage,
-        senderId: userId,
-        timestamp: Date.now(),
-      }),
-    }));
+    // For channels, get all members and notify them
+    const members = await sql`
+      SELECT "userId" FROM "ChannelMember" WHERE "channelId" = ${channelId} AND "userId" != ${userId}
+    `;
+    for (const member of members) {
+      await broadcastToUser(c.env, member.userId, 'message', fullMessage);
+    }
   }
   
   return jsonResponse(fullMessage);
@@ -242,7 +265,6 @@ app.post('/api/messages', async (c) => {
 
 // ==================== CHANNELS ====================
 
-// Get channels
 app.get('/api/channels', async (c) => {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
@@ -261,7 +283,6 @@ app.get('/api/channels', async (c) => {
   return jsonResponse(channels);
 });
 
-// Create channel
 app.post('/api/channels', async (c) => {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
@@ -282,7 +303,6 @@ app.post('/api/channels', async (c) => {
     RETURNING *
   `;
   
-  // Add creator as admin
   await sql`
     INSERT INTO "ChannelMember" (id, "channelId", "userId", role, "joinedAt")
     VALUES (gen_random_uuid(), ${channel.id}, ${userId}, 'admin', NOW())
@@ -293,7 +313,6 @@ app.post('/api/channels', async (c) => {
 
 // ==================== USERS ====================
 
-// Search users
 app.get('/api/users/search', async (c) => {
   const userId = await verifyUser(c.req.raw, c.env);
   if (!userId) {
@@ -318,68 +337,14 @@ app.get('/api/users/search', async (c) => {
   return jsonResponse(users);
 });
 
-// ==================== WEBSOCKET ====================
+// ==================== CALLS (WebSocket) ====================
 
-// HTTP endpoint for broadcasting messages (called from Next.js API)
-app.post('/ws/user/:userId', async (c) => {
-  const userId = c.req.param('userId');
-  const roomId = `user-${userId}`;
-  
-  try {
-    const body = await c.req.json();
-    
-    const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-    await room.fetch(new Request('https://internal/broadcast', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    }));
-    
-    return jsonResponse({ success: true });
-  } catch (e) {
-    return jsonResponse({ success: false, error: 'Broadcast failed' }, 500);
-  }
-});
-
-// WebSocket endpoint for user events
-app.get('/ws/user/:userId', async (c) => {
-  const userId = c.req.param('userId');
-  const roomId = `user-${userId}`;
-  
-  // Add userId to query params for Durable Object
-  const url = new URL(c.req.url);
-  url.searchParams.set('userId', userId);
-  const modifiedRequest = new Request(url.toString(), c.req.raw);
-  
-  const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-  return room.fetch(modifiedRequest);
-});
-
-// WebSocket endpoint for channel events
-app.get('/ws/channel/:channelId', async (c) => {
-  const channelId = c.req.param('channelId');
-  const userId = c.req.query('userId');
-  const roomId = `channel-${channelId}`;
-  
-  // Add userId to query params for Durable Object
-  const url = new URL(c.req.url);
-  if (userId) {
-    url.searchParams.set('userId', userId);
-  }
-  const modifiedRequest = new Request(url.toString(), c.req.raw);
-  
-  const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-  return room.fetch(modifiedRequest);
-});
-
-// WebSocket endpoint for calls
 app.get('/ws/call/:callId', async (c) => {
   const callId = c.req.param('callId');
   const userId = c.req.query('userId');
   
   const room = c.env.CALL_ROOM.get(c.env.CALL_ROOM.idFromName(callId));
   
-  // Add userId to query params
   const url = new URL(c.req.url);
   url.searchParams.set('userId', userId || '');
   url.searchParams.set('callId', callId);
@@ -394,12 +359,13 @@ app.get('/', (c) => {
   return c.json({ 
     status: 'ok', 
     service: 'void-realtime',
-    version: '2.1.0',
+    version: '3.0.0-sse',
+    transport: 'Server-Sent Events',
     endpoints: {
-      websocket: {
-        user: '/ws/user/:userId',
-        channel: '/ws/channel/:channelId',
-        call: '/ws/call/:callId',
+      sse: {
+        subscribe: 'POST /sse/subscribe',
+        unsubscribe: 'POST /sse/unsubscribe',
+        online: 'GET /sse/online/:userId'
       },
       api: {
         auth: '/api/auth/me',
@@ -407,10 +373,34 @@ app.get('/', (c) => {
         messages: '/api/messages',
         channels: '/api/channels',
         users: '/api/users/search',
-      }
+      },
+      calls: '/ws/call/:callId'
     }
   });
 });
+
+// ==================== HELPER FUNCTIONS ====================
+
+/**
+ * Broadcast message to user via SSE
+ * Simple, reliable, no complex WebSocket handling
+ */
+async function broadcastToUser(env: Env, userId: string, type: string, data: any): Promise<void> {
+  try {
+    const roomId = `user-${userId}`;
+    const room = env.CHAT_ROOM.get(env.CHAT_ROOM.idFromName(roomId));
+    
+    await room.fetch(new Request('https://internal/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type, data })
+    }));
+    
+    console.log(`[Worker] Broadcast ${type} to user ${userId}`);
+  } catch (error) {
+    console.error(`[Worker] Failed to broadcast to user ${userId}:`, error);
+  }
+}
 
 // Export handler
 export default app;

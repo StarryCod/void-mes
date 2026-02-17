@@ -1,25 +1,31 @@
 import { DurableObject } from 'cloudflare:workers';
 import { Env, corsHeaders } from './types';
 
-interface WebSocketWithMetadata {
-  websocket: WebSocket;
+// SSE connection metadata
+interface SSEConnection {
   userId: string;
-  joinedAt: number;
+  connectedAt: number;
+  lastHeartbeat: number;
 }
 
-interface ChatMessage {
-  type: 'message' | 'typing' | 'read' | 'presence' | 'contact' | 'call' | 'ping';
-  action: string;
+// Message for broadcast
+interface BroadcastMessage {
+  type: 'message' | 'presence' | 'contact' | 'typing' | 'heartbeat';
   data: any;
-  senderId?: string;
-  timestamp?: number;
+  targetUserIds?: string[];
 }
 
-// ChatRoom Durable Object - handles WebSocket connections for a specific room
+/**
+ * SSE Chat Room Durable Object
+ * 
+ * Простая и надежная реализация:
+ * - Хранит активные SSE соединения
+ * - Пушит сообщения подключенным клиентам
+ * - Автоматически чистит мертвые соединения
+ */
 export class ChatRoom extends DurableObject {
-  private sessions: Map<WebSocket, WebSocketWithMetadata> = new Map();
-  private lastActivity: number = Date.now();
-
+  private connections: Map<string, { userId: string; writer: WritableStreamDefaultWriter; lastActivity: number }> = new Map();
+  
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
   }
@@ -27,153 +33,206 @@ export class ChatRoom extends DurableObject {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     
-    // Handle WebSocket upgrade
-    if (request.headers.get('Upgrade') === 'websocket') {
-      return this.handleWebSocket(request);
+    // SSE subscribe endpoint
+    if (url.pathname === '/subscribe' && request.method === 'POST') {
+      return this.handleSubscribe(request);
     }
     
-    // Handle HTTP requests for room state
-    if (url.pathname === '/users') {
-      const users = Array.from(this.sessions.values()).map(s => ({
-        userId: s.userId,
-        joinedAt: s.joinedAt,
-      }));
-      return new Response(JSON.stringify(users), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
-      });
-    }
-    
+    // Broadcast endpoint (called from main worker)
     if (url.pathname === '/broadcast' && request.method === 'POST') {
-      const body = await request.json() as ChatMessage;
-      await this.broadcast(body);
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
-      });
+      return this.handleBroadcast(request);
+    }
+    
+    // Unsubscribe endpoint
+    if (url.pathname === '/unsubscribe' && request.method === 'POST') {
+      return this.handleUnsubscribe(request);
+    }
+    
+    // Get online users
+    if (url.pathname === '/online') {
+      return this.getOnlineUsers();
+    }
+    
+    // Health check
+    if (url.pathname === '/health') {
+      return new Response(JSON.stringify({
+        status: 'ok',
+        connections: this.connections.size,
+        users: [...new Set([...this.connections.values()].map(c => c.userId))]
+      }), { headers: { 'Content-Type': 'application/json' } });
     }
     
     return new Response('Not Found', { status: 404 });
   }
 
-  async handleWebSocket(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const userId = url.searchParams.get('userId');
+  /**
+   * Handle SSE subscription
+   */
+  async handleSubscribe(request: Request): Promise<Response> {
+    const body = await request.json() as { userId: string; sessionId: string };
+    const { userId, sessionId } = body;
     
-    if (!userId) {
-      return new Response('Missing userId', { status: 400 });
+    if (!userId || !sessionId) {
+      return new Response(JSON.stringify({ error: 'userId and sessionId required' }), { 
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
 
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+    // Clean up dead connections first
+    this.cleanupDeadConnections();
     
-    server.accept();
-    
-    const metadata: WebSocketWithMetadata = {
-      websocket: server,
-      userId,
-      joinedAt: Date.now(),
-    };
-    
-    this.sessions.set(server, metadata);
-    this.lastActivity = Date.now();
-    
-    // Notify others that user joined
-    await this.broadcast({
-      type: 'presence',
-      action: 'online',
-      data: { userId },
-      timestamp: Date.now(),
-    }, server);
-    
-    server.addEventListener('message', async (event) => {
+    // Check if user already has a connection with this session
+    const existing = this.connections.get(sessionId);
+    if (existing) {
       try {
-        const msg = JSON.parse(event.data as string) as ChatMessage;
-        msg.senderId = userId;
-        msg.timestamp = Date.now();
-        
-        await this.handleMessage(server, msg);
-      } catch (e) {
-        console.error('Failed to parse message:', e);
+        await existing.writer.close();
+      } catch (e) {}
+      this.connections.delete(sessionId);
+    }
+
+    // Create SSE stream
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    
+    // Store connection
+    this.connections.set(sessionId, {
+      userId,
+      writer,
+      lastActivity: Date.now()
+    });
+    
+    // Send initial connected event
+    await this.sendEvent(writer, 'connected', { sessionId, userId });
+    
+    // Start heartbeat in background
+    this.startHeartbeat(sessionId, writer).catch(() => {
+      this.connections.delete(sessionId);
+    });
+    
+    console.log(`[ChatRoom] User ${userId} subscribed. Total: ${this.connections.size}`);
+    
+    return new Response(readable, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        ...corsHeaders()
       }
     });
+  }
+
+  /**
+   * Handle broadcast request from main worker
+   */
+  async handleBroadcast(request: Request): Promise<Response> {
+    const body = await request.json() as BroadcastMessage;
+    const { type, data, targetUserIds } = body;
     
-    server.addEventListener('close', async () => {
-      this.sessions.delete(server);
+    let sentCount = 0;
+    const deadSessions: string[] = [];
+    
+    for (const [sessionId, conn] of this.connections) {
+      if (targetUserIds && !targetUserIds.includes(conn.userId)) {
+        continue;
+      }
       
-      // Notify others that user left
-      await this.broadcast({
-        type: 'presence',
-        action: 'offline',
-        data: { userId },
-        timestamp: Date.now(),
-      });
-    });
+      try {
+        await this.sendEvent(conn.writer, type, data);
+        sentCount++;
+      } catch (e) {
+        deadSessions.push(sessionId);
+      }
+    }
     
-    server.addEventListener('error', (e) => {
-      console.error('WebSocket error:', e);
-      this.sessions.delete(server);
-    });
+    for (const sessionId of deadSessions) {
+      this.connections.delete(sessionId);
+    }
     
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
+    return new Response(JSON.stringify({ success: true, sent: sentCount }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() }
     });
   }
 
-  async handleMessage(sender: WebSocket, msg: ChatMessage): Promise<void> {
-    this.lastActivity = Date.now();
+  /**
+   * Handle unsubscribe
+   */
+  async handleUnsubscribe(request: Request): Promise<Response> {
+    const body = await request.json() as { sessionId: string };
+    const { sessionId } = body;
     
-    switch (msg.type) {
-      case 'message':
-        // Don't broadcast 'send' action - it's handled by API
-        // Only broadcast if it's already a 'new' message from API
-        if (msg.action === 'new') {
-          await this.broadcast(msg, sender);
-        }
-        // Ignore 'send' action - messages are sent via REST API
+    const conn = this.connections.get(sessionId);
+    if (conn) {
+      try {
+        await conn.writer.close();
+      } catch (e) {}
+      this.connections.delete(sessionId);
+    }
+    
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() }
+    });
+  }
+
+  /**
+   * Get online users
+   */
+  async getOnlineUsers(): Promise<Response> {
+    const users = [...new Set([...this.connections.values()].map(c => c.userId))];
+    return new Response(JSON.stringify({ users, count: users.length }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() }
+    });
+  }
+
+  /**
+   * Send SSE event
+   */
+  private async sendEvent(writer: WritableStreamDefaultWriter, type: string, data: any): Promise<void> {
+    const event = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+    await writer.write(new TextEncoder().encode(event));
+  }
+
+  /**
+   * Start heartbeat
+   */
+  private async startHeartbeat(sessionId: string, writer: WritableStreamDefaultWriter): Promise<void> {
+    while (true) {
+      await new Promise(resolve => setTimeout(resolve, 30000));
+      
+      const conn = this.connections.get(sessionId);
+      if (!conn) break;
+      
+      try {
+        await this.sendEvent(writer, 'heartbeat', { timestamp: Date.now() });
+        conn.lastActivity = Date.now();
+      } catch (e) {
+        this.connections.delete(sessionId);
         break;
-        
-      case 'typing':
-        // Broadcast typing indicator
-        await this.broadcast(msg, sender);
-        break;
-        
-      case 'read':
-        // Mark messages as read
-        await this.broadcast(msg, sender);
-        break;
-        
-      case 'contact':
-        // Contact request notification
-        await this.broadcast(msg, sender);
-        break;
-        
-      case 'call':
-        // Call signaling
-        await this.broadcast(msg, sender);
-        break;
-        
-      case 'ping':
-        // Respond with pong
-        sender.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
-        break;
-        
-      default:
-        console.log('Unknown message type:', msg.type);
+      }
     }
   }
 
-  async broadcast(message: ChatMessage, exclude?: WebSocket): Promise<void> {
-    const messageStr = JSON.stringify(message);
+  /**
+   * Clean up dead connections
+   */
+  private cleanupDeadConnections(): void {
+    const now = Date.now();
+    const timeout = 120000;
     
-    for (const [ws] of this.sessions) {
-      if (ws !== exclude && ws.readyState === WebSocket.OPEN) {
-        ws.send(messageStr);
+    for (const [sessionId, conn] of this.connections) {
+      if (now - conn.lastActivity > timeout) {
+        try {
+          conn.writer.close();
+        } catch (e) {}
+        this.connections.delete(sessionId);
       }
     }
   }
 }
 
-// CallRoom Durable Object - handles WebRTC signaling
+/**
+ * CallRoom Durable Object - WebRTC signaling (WebSocket for calls)
+ */
 export class CallRoom extends DurableObject {
   private participants: Map<string, WebSocket> = new Map();
   private callState: 'idle' | 'ringing' | 'connected' = 'idle';
@@ -210,21 +269,18 @@ export class CallRoom extends DurableObject {
         const msg = JSON.parse(event.data as string);
         msg.senderId = userId;
         
-        // Handle WebRTC signaling
         switch (msg.type) {
           case 'offer':
           case 'answer':
           case 'ice-candidate':
-            // Forward to specific target
             const targetWs = this.participants.get(msg.targetId);
-            if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+            if (targetWs?.readyState === WebSocket.OPEN) {
               targetWs.send(JSON.stringify(msg));
             }
             break;
             
           case 'call-start':
             this.callState = 'ringing';
-            // Notify other participants
             for (const [id, ws] of this.participants) {
               if (id !== userId && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
@@ -233,6 +289,7 @@ export class CallRoom extends DurableObject {
                   callId,
                   callType: msg.callType,
                   signal: msg.signal,
+                  callerName: msg.callerName,
                 }));
               }
             }
@@ -241,7 +298,7 @@ export class CallRoom extends DurableObject {
           case 'call-answer':
             this.callState = 'connected';
             const callerWs = this.participants.get(msg.targetId);
-            if (callerWs && callerWs.readyState === WebSocket.OPEN) {
+            if (callerWs?.readyState === WebSocket.OPEN) {
               callerWs.send(JSON.stringify({
                 type: 'call-answered',
                 answererId: userId,
@@ -253,7 +310,6 @@ export class CallRoom extends DurableObject {
           case 'call-reject':
           case 'call-end':
             this.callState = 'idle';
-            // Notify all participants
             for (const [id, ws] of this.participants) {
               if (id !== userId && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({
@@ -271,21 +327,13 @@ export class CallRoom extends DurableObject {
     
     server.addEventListener('close', () => {
       this.participants.delete(userId);
-      
-      // Notify others that participant left
       for (const [id, ws] of this.participants) {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: 'call-ended',
-            senderId: userId,
-          }));
+          ws.send(JSON.stringify({ type: 'call-ended', senderId: userId }));
         }
       }
     });
     
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
-    });
+    return new Response(null, { status: 101, webSocket: client });
   }
 }
