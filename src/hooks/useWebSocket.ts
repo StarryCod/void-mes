@@ -11,7 +11,7 @@ let reconnectTimeout: NodeJS.Timeout | null = null;
 
 // Cloudflare Workers URL - must use wss:// for secure WebSocket
 const getWebSocketUrl = (userId: string) => {
-  const baseUrl = process.env.NEXT_PUBLIC_CF_WORKERS_URL || 'https://void-time.starrycod.workers.dev';
+  const baseUrl = process.env.NEXT_PUBLIC_CF_WORKERS_URL || 'https://void-time.mr-starred09.workers.dev';
   // Convert https:// to wss:// for WebSocket
   const wsUrl = baseUrl.replace(/^https?:\/\//, 'wss://');
   return `${wsUrl}/ws/user/${userId}`;
