@@ -1,73 +1,40 @@
 import { DurableObject } from 'cloudflare:workers';
-import { Env, corsHeaders } from './types';
-
-// SSE connection metadata
-interface SSEConnection {
-  userId: string;
-  connectedAt: number;
-  lastHeartbeat: number;
-}
-
-// Message for broadcast
-interface BroadcastMessage {
-  type: 'message' | 'presence' | 'contact' | 'typing' | 'heartbeat';
-  data: any;
-  targetUserIds?: string[];
-}
+import { corsHeaders } from './types';
 
 /**
- * SSE Chat Room Durable Object
+ * ChatRoom Durable Object - минимальный, только SSE
  * 
- * Простая и надежная реализация:
- * - Хранит активные SSE соединения
- * - Пушит сообщения подключенным клиентам
- * - Автоматически чистит мертвые соединения
+ * Хранит SSE соединения и пушит сообщения.
+ * Никакой логики, никаких запросов к БД!
  */
 export class ChatRoom extends DurableObject {
-  private connections: Map<string, { userId: string; writer: WritableStreamDefaultWriter; lastActivity: number }> = new Map();
-  
-  constructor(state: DurableObjectState, env: Env) {
-    super(state, env);
-  }
+  private connections: Map<string, { 
+    userId: string; 
+    writer: WritableStreamDefaultWriter; 
+    lastActivity: number 
+  }> = new Map();
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     
-    // SSE subscribe endpoint
+    // SSE subscribe
     if (url.pathname === '/subscribe' && request.method === 'POST') {
       return this.handleSubscribe(request);
     }
     
-    // Broadcast endpoint (called from main worker)
+    // Broadcast (called from main worker)
     if (url.pathname === '/broadcast' && request.method === 'POST') {
       return this.handleBroadcast(request);
     }
     
-    // Unsubscribe endpoint
+    // Unsubscribe
     if (url.pathname === '/unsubscribe' && request.method === 'POST') {
       return this.handleUnsubscribe(request);
-    }
-    
-    // Get online users
-    if (url.pathname === '/online') {
-      return this.getOnlineUsers();
-    }
-    
-    // Health check
-    if (url.pathname === '/health') {
-      return new Response(JSON.stringify({
-        status: 'ok',
-        connections: this.connections.size,
-        users: [...new Set([...this.connections.values()].map(c => c.userId))]
-      }), { headers: { 'Content-Type': 'application/json' } });
     }
     
     return new Response('Not Found', { status: 404 });
   }
 
-  /**
-   * Handle SSE subscription
-   */
   async handleSubscribe(request: Request): Promise<Response> {
     const body = await request.json() as { userId: string; sessionId: string };
     const { userId, sessionId } = body;
@@ -79,15 +46,13 @@ export class ChatRoom extends DurableObject {
       });
     }
 
-    // Clean up dead connections first
-    this.cleanupDeadConnections();
+    // Clean dead connections
+    this.cleanup();
     
-    // Check if user already has a connection with this session
+    // Close old connection if exists
     const existing = this.connections.get(sessionId);
     if (existing) {
-      try {
-        await existing.writer.close();
-      } catch (e) {}
+      try { await existing.writer.close(); } catch (e) {}
       this.connections.delete(sessionId);
     }
 
@@ -95,22 +60,19 @@ export class ChatRoom extends DurableObject {
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
     
-    // Store connection
     this.connections.set(sessionId, {
       userId,
       writer,
       lastActivity: Date.now()
     });
     
-    // Send initial connected event
-    await this.sendEvent(writer, 'connected', { sessionId, userId });
+    // Send connected event
+    await this.send(writer, 'connected', { sessionId, userId });
     
-    // Start heartbeat in background
-    this.startHeartbeat(sessionId, writer).catch(() => {
-      this.connections.delete(sessionId);
-    });
+    // Start heartbeat
+    this.heartbeat(sessionId, writer);
     
-    console.log(`[ChatRoom] User ${userId} subscribed. Total: ${this.connections.size}`);
+    console.log(`[ChatRoom] User ${userId} connected. Total: ${this.connections.size}`);
     
     return new Response(readable, {
       headers: {
@@ -122,88 +84,56 @@ export class ChatRoom extends DurableObject {
     });
   }
 
-  /**
-   * Handle broadcast request from main worker
-   */
   async handleBroadcast(request: Request): Promise<Response> {
-    const body = await request.json() as BroadcastMessage;
-    const { type, data, targetUserIds } = body;
+    const body = await request.json() as { type: string; data: any };
+    const { type, data } = body;
     
-    let sentCount = 0;
-    const deadSessions: string[] = [];
+    let sent = 0;
+    const dead: string[] = [];
     
     for (const [sessionId, conn] of this.connections) {
-      if (targetUserIds && !targetUserIds.includes(conn.userId)) {
-        continue;
-      }
-      
       try {
-        await this.sendEvent(conn.writer, type, data);
-        sentCount++;
+        await this.send(conn.writer, type, data);
+        sent++;
       } catch (e) {
-        deadSessions.push(sessionId);
+        dead.push(sessionId);
       }
     }
     
-    for (const sessionId of deadSessions) {
-      this.connections.delete(sessionId);
+    // Cleanup dead
+    for (const id of dead) {
+      this.connections.delete(id);
     }
     
-    return new Response(JSON.stringify({ success: true, sent: sentCount }), {
+    return new Response(JSON.stringify({ success: true, sent }), {
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
     });
   }
 
-  /**
-   * Handle unsubscribe
-   */
   async handleUnsubscribe(request: Request): Promise<Response> {
     const body = await request.json() as { sessionId: string };
-    const { sessionId } = body;
-    
-    const conn = this.connections.get(sessionId);
+    const conn = this.connections.get(body.sessionId);
     if (conn) {
-      try {
-        await conn.writer.close();
-      } catch (e) {}
-      this.connections.delete(sessionId);
+      try { await conn.writer.close(); } catch (e) {}
+      this.connections.delete(body.sessionId);
     }
-    
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
     });
   }
 
-  /**
-   * Get online users
-   */
-  async getOnlineUsers(): Promise<Response> {
-    const users = [...new Set([...this.connections.values()].map(c => c.userId))];
-    return new Response(JSON.stringify({ users, count: users.length }), {
-      headers: { 'Content-Type': 'application/json', ...corsHeaders() }
-    });
-  }
-
-  /**
-   * Send SSE event
-   */
-  private async sendEvent(writer: WritableStreamDefaultWriter, type: string, data: any): Promise<void> {
+  private async send(writer: WritableStreamDefaultWriter, type: string, data: any): Promise<void> {
     const event = `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
     await writer.write(new TextEncoder().encode(event));
   }
 
-  /**
-   * Start heartbeat
-   */
-  private async startHeartbeat(sessionId: string, writer: WritableStreamDefaultWriter): Promise<void> {
+  private async heartbeat(sessionId: string, writer: WritableStreamDefaultWriter): Promise<void> {
     while (true) {
-      await new Promise(resolve => setTimeout(resolve, 30000));
-      
+      await new Promise(r => setTimeout(r, 30000));
       const conn = this.connections.get(sessionId);
       if (!conn) break;
-      
       try {
-        await this.sendEvent(writer, 'heartbeat', { timestamp: Date.now() });
+        await this.send(writer, 'heartbeat', { ts: Date.now() });
         conn.lastActivity = Date.now();
       } catch (e) {
         this.connections.delete(sessionId);
@@ -212,47 +142,33 @@ export class ChatRoom extends DurableObject {
     }
   }
 
-  /**
-   * Clean up dead connections
-   */
-  private cleanupDeadConnections(): void {
+  private cleanup(): void {
     const now = Date.now();
-    const timeout = 120000;
-    
-    for (const [sessionId, conn] of this.connections) {
-      if (now - conn.lastActivity > timeout) {
-        try {
-          conn.writer.close();
-        } catch (e) {}
-        this.connections.delete(sessionId);
+    for (const [id, conn] of this.connections) {
+      if (now - conn.lastActivity > 120000) {
+        try { conn.writer.close(); } catch (e) {}
+        this.connections.delete(id);
       }
     }
   }
 }
 
 /**
- * CallRoom Durable Object - WebRTC signaling (WebSocket for calls)
+ * CallRoom - WebSocket для звонков (WebRTC signaling)
  */
 export class CallRoom extends DurableObject {
   private participants: Map<string, WebSocket> = new Map();
-  private callState: 'idle' | 'ringing' | 'connected' = 'idle';
-
-  constructor(state: DurableObjectState, env: Env) {
-    super(state, env);
-  }
 
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get('Upgrade') === 'websocket') {
       return this.handleWebSocket(request);
     }
-    
     return new Response('Not Found', { status: 404 });
   }
 
   async handleWebSocket(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const userId = url.searchParams.get('userId');
-    const callId = url.searchParams.get('callId');
     
     if (!userId) {
       return new Response('Missing userId', { status: 400 });
@@ -269,69 +185,18 @@ export class CallRoom extends DurableObject {
         const msg = JSON.parse(event.data as string);
         msg.senderId = userId;
         
-        switch (msg.type) {
-          case 'offer':
-          case 'answer':
-          case 'ice-candidate':
-            const targetWs = this.participants.get(msg.targetId);
-            if (targetWs?.readyState === WebSocket.OPEN) {
-              targetWs.send(JSON.stringify(msg));
-            }
-            break;
-            
-          case 'call-start':
-            this.callState = 'ringing';
-            for (const [id, ws] of this.participants) {
-              if (id !== userId && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                  type: 'incoming-call',
-                  callerId: userId,
-                  callId,
-                  callType: msg.callType,
-                  signal: msg.signal,
-                  callerName: msg.callerName,
-                }));
-              }
-            }
-            break;
-            
-          case 'call-answer':
-            this.callState = 'connected';
-            const callerWs = this.participants.get(msg.targetId);
-            if (callerWs?.readyState === WebSocket.OPEN) {
-              callerWs.send(JSON.stringify({
-                type: 'call-answered',
-                answererId: userId,
-                signal: msg.signal,
-              }));
-            }
-            break;
-            
-          case 'call-reject':
-          case 'call-end':
-            this.callState = 'idle';
-            for (const [id, ws] of this.participants) {
-              if (id !== userId && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                  type: msg.type === 'call-reject' ? 'call-rejected' : 'call-ended',
-                  senderId: userId,
-                }));
-              }
-            }
-            break;
+        // Forward to target
+        if (msg.targetId) {
+          const target = this.participants.get(msg.targetId);
+          if (target?.readyState === WebSocket.OPEN) {
+            target.send(JSON.stringify(msg));
+          }
         }
-      } catch (e) {
-        console.error('Failed to handle call message:', e);
-      }
+      } catch (e) {}
     });
     
     server.addEventListener('close', () => {
       this.participants.delete(userId);
-      for (const [id, ws] of this.participants) {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'call-ended', senderId: userId }));
-        }
-      }
     });
     
     return new Response(null, { status: 101, webSocket: client });
