@@ -394,7 +394,7 @@ app.get('/', (c) => {
   return c.json({ 
     status: 'ok', 
     service: 'void-realtime',
-    version: '2.0.0',
+    version: '2.1.0',
     endpoints: {
       websocket: {
         user: '/ws/user/:userId',
