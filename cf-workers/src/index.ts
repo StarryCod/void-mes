@@ -238,7 +238,7 @@ app.post('/api/messages', async (c) => {
   }
   
   return jsonResponse(fullMessage);
-}
+});
 
 // ==================== CHANNELS ====================
 
@@ -319,6 +319,27 @@ app.get('/api/users/search', async (c) => {
 });
 
 // ==================== WEBSOCKET ====================
+
+// HTTP endpoint for broadcasting messages (called from Next.js API)
+app.post('/ws/user/:userId', async (c) => {
+  const userId = c.req.param('userId');
+  const roomId = `user-${userId}`;
+  
+  try {
+    const body = await c.req.json();
+    
+    const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
+    await room.fetch(new Request('https://internal/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }));
+    
+    return jsonResponse({ success: true });
+  } catch (e) {
+    return jsonResponse({ success: false, error: 'Broadcast failed' }, 500);
+  }
+});
 
 // WebSocket endpoint for user events
 app.get('/ws/user/:userId', async (c) => {
