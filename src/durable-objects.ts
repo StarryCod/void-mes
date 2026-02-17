@@ -1,212 +1,178 @@
 import { DurableObject } from 'cloudflare:workers';
+import { Env, corsHeaders } from './types';
 
-interface Env {
-  DATABASE_URL: string;
-}
-
-interface WebSocketData {
+interface WebSocketWithMetadata {
+  websocket: WebSocket;
   userId: string;
   joinedAt: number;
 }
 
-// ChatRoom Durable Object
+interface ChatMessage {
+  type: 'message' | 'typing' | 'read' | 'presence' | 'contact' | 'call';
+  action: string;
+  data: any;
+  senderId?: string;
+  timestamp?: number;
+}
+
+// ChatRoom Durable Object - handles WebSocket connections for a specific room
 export class ChatRoom extends DurableObject {
-  private sessions: Map<WebSocket, WebSocketData> = new Map();
-  
+  private sessions: Map<WebSocket, WebSocketWithMetadata> = new Map();
+  private lastActivity: number = Date.now();
+
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
   }
-  
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     
     // Handle WebSocket upgrade
     if (request.headers.get('Upgrade') === 'websocket') {
-      return this.handleWebSocket(request, url);
-    }
-    
-    // Handle HTTP requests for broadcasting
-    if (url.pathname === '/broadcast' && request.method === 'POST') {
-      try {
-        const body = await request.json();
-        await this.broadcast(body);
-        return new Response(JSON.stringify({ success: true }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: 'Invalid body' }), {
-          status: 400,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
+      return this.handleWebSocket(request);
     }
     
     // Handle HTTP requests for room state
     if (url.pathname === '/users') {
-      const users: Array<{ userId: string; joinedAt: number }> = [];
-      this.sessions.forEach(function(data) {
-        users.push({ userId: data.userId, joinedAt: data.joinedAt });
-      });
+      const users = Array.from(this.sessions.values()).map(s => ({
+        userId: s.userId,
+        joinedAt: s.joinedAt,
+      }));
       return new Response(JSON.stringify(users), {
-        headers: { 
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        }
+        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+      });
+    }
+    
+    if (url.pathname === '/broadcast' && request.method === 'POST') {
+      const body = await request.json() as ChatMessage;
+      await this.broadcast(body);
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       });
     }
     
     return new Response('Not Found', { status: 404 });
   }
-  
-  async handleWebSocket(request: Request, url: URL): Promise<Response> {
+
+  async handleWebSocket(request: Request): Promise<Response> {
+    const url = new URL(request.url);
     const userId = url.searchParams.get('userId');
     
     if (!userId) {
       return new Response('Missing userId', { status: 400 });
     }
-    
+
     const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
+    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     
     server.accept();
     
-    const data: WebSocketData = {
-      userId: userId,
-      joinedAt: Date.now()
+    const metadata: WebSocketWithMetadata = {
+      websocket: server,
+      userId,
+      joinedAt: Date.now(),
     };
     
-    this.sessions.set(server, data);
+    this.sessions.set(server, metadata);
+    this.lastActivity = Date.now();
     
     // Notify others that user joined
     await this.broadcast({
       type: 'presence',
       action: 'online',
-      data: { userId: userId },
-      timestamp: Date.now()
+      data: { userId },
+      timestamp: Date.now(),
     }, server);
     
-    const self = this;
-    
-    server.addEventListener('message', function(event) {
+    server.addEventListener('message', async (event) => {
       try {
-        const msg = JSON.parse(event.data as string);
-        self.handleMessage(server, msg, userId);
+        const msg = JSON.parse(event.data as string) as ChatMessage;
+        msg.senderId = userId;
+        msg.timestamp = Date.now();
+        
+        await this.handleMessage(server, msg);
       } catch (e) {
         console.error('Failed to parse message:', e);
       }
     });
     
-    server.addEventListener('close', function() {
-      self.sessions.delete(server);
-      self.broadcast({
+    server.addEventListener('close', async () => {
+      this.sessions.delete(server);
+      
+      // Notify others that user left
+      await this.broadcast({
         type: 'presence',
         action: 'offline',
-        data: { userId: userId },
-        timestamp: Date.now()
+        data: { userId },
+        timestamp: Date.now(),
       });
     });
     
-    server.addEventListener('error', function(e) {
+    server.addEventListener('error', (e) => {
       console.error('WebSocket error:', e);
-      self.sessions.delete(server);
+      this.sessions.delete(server);
     });
     
     return new Response(null, {
       status: 101,
-      webSocket: client
+      webSocket: client,
     });
   }
-  
-  handleMessage(sender: WebSocket, msg: any, senderUserId: string): void {
-    const { type, action, data, targetId, receiverId, channelId, isTyping } = msg;
+
+  async handleMessage(sender: WebSocket, msg: ChatMessage): Promise<void> {
+    this.lastActivity = Date.now();
     
-    switch (type) {
+    switch (msg.type) {
       case 'message':
-        // Broadcast message to all connected clients in this room
-        // (For DMs, the receiver will be in their own room, notified via HTTP)
-        this.broadcast({
-          type: 'message',
-          action: 'new',
-          data: data,
-          senderId: senderUserId,
-          timestamp: Date.now()
-        }, sender);
+        // Broadcast message to all in room
+        await this.broadcast(msg);
         break;
         
       case 'typing':
         // Broadcast typing indicator
-        this.broadcast({
-          type: 'typing',
-          action: isTyping ? 'start' : 'stop',
-          senderId: senderUserId,
-          data: { targetId: targetId || receiverId },
-          timestamp: Date.now()
-        }, sender);
+        await this.broadcast(msg, sender);
         break;
         
       case 'read':
-        // Broadcast read receipt
-        this.broadcast({
-          type: 'read',
-          action: 'mark',
-          senderId: senderUserId,
-          data: { targetId: targetId },
-          timestamp: Date.now()
-        }, sender);
+        // Mark messages as read
+        await this.broadcast(msg, sender);
         break;
         
       case 'contact':
-        // Broadcast contact notification
-        this.broadcast({
-          type: 'contact',
-          action: action || 'new',
-          data: data,
-          senderId: senderUserId,
-          timestamp: Date.now()
-        }, sender);
+        // Contact request notification
+        await this.broadcast(msg, sender);
         break;
         
       case 'call':
-        // Handle call signaling - broadcast to room
-        this.broadcast({
-          type: 'call',
-          action: action,
-          data: data,
-          senderId: senderUserId,
-          timestamp: Date.now()
-        }, sender);
-        break;
-        
-      case 'ping':
-        // Heartbeat - just respond with pong
-        sender.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+        // Call signaling
+        await this.broadcast(msg, sender);
         break;
         
       default:
-        console.log('Unknown message type:', type);
+        console.log('Unknown message type:', msg.type);
     }
   }
-  
-  async broadcast(message: any, exclude?: WebSocket): Promise<void> {
+
+  async broadcast(message: ChatMessage, exclude?: WebSocket): Promise<void> {
     const messageStr = JSON.stringify(message);
     
-    this.sessions.forEach(function(data, ws) {
+    for (const [ws] of this.sessions) {
       if (ws !== exclude && ws.readyState === WebSocket.OPEN) {
         ws.send(messageStr);
       }
-    });
+    }
   }
 }
 
-// CallRoom Durable Object
+// CallRoom Durable Object - handles WebRTC signaling
 export class CallRoom extends DurableObject {
   private participants: Map<string, WebSocket> = new Map();
-  
+  private callState: 'idle' | 'ringing' | 'connected' = 'idle';
+
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
   }
-  
+
   async fetch(request: Request): Promise<Response> {
     if (request.headers.get('Upgrade') === 'websocket') {
       return this.handleWebSocket(request);
@@ -214,94 +180,78 @@ export class CallRoom extends DurableObject {
     
     return new Response('Not Found', { status: 404 });
   }
-  
+
   async handleWebSocket(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const userId = url.searchParams.get('userId') || '';
-    const callId = url.searchParams.get('callId') || '';
+    const userId = url.searchParams.get('userId');
+    const callId = url.searchParams.get('callId');
     
+    if (!userId) {
+      return new Response('Missing userId', { status: 400 });
+    }
+
     const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
+    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     
     server.accept();
     this.participants.set(userId, server);
     
-    // Notify others that participant joined
-    const self = this;
-    this.participants.forEach(function(ws, id) {
-      if (id !== userId && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'call',
-          action: 'participant-joined',
-          data: { userId, callId },
-          timestamp: Date.now()
-        }));
-      }
-    });
-    
-    server.addEventListener('message', function(event) {
+    server.addEventListener('message', async (event) => {
       try {
         const msg = JSON.parse(event.data as string);
         msg.senderId = userId;
         
+        // Handle WebRTC signaling
         switch (msg.type) {
           case 'offer':
           case 'answer':
           case 'ice-candidate':
-            const targetWs = self.participants.get(msg.targetId);
+            // Forward to specific target
+            const targetWs = this.participants.get(msg.targetId);
             if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-              targetWs.send(JSON.stringify({
-                type: msg.type,
-                senderId: userId,
-                data: msg.data || msg.signal || msg.candidate,
-                timestamp: Date.now()
+              targetWs.send(JSON.stringify(msg));
+            }
+            break;
+            
+          case 'call-start':
+            this.callState = 'ringing';
+            // Notify other participants
+            for (const [id, ws] of this.participants) {
+              if (id !== userId && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: 'incoming-call',
+                  callerId: userId,
+                  callId,
+                  callType: msg.callType,
+                  signal: msg.signal,
+                }));
+              }
+            }
+            break;
+            
+          case 'call-answer':
+            this.callState = 'connected';
+            const callerWs = this.participants.get(msg.targetId);
+            if (callerWs && callerWs.readyState === WebSocket.OPEN) {
+              callerWs.send(JSON.stringify({
+                type: 'call-answered',
+                answererId: userId,
+                signal: msg.signal,
               }));
             }
             break;
             
-          case 'call':
-            if (msg.action === 'start') {
-              self.participants.forEach(function(ws, id) {
-                if (id !== userId && ws.readyState === WebSocket.OPEN) {
-                  ws.send(JSON.stringify({
-                    type: 'call',
-                    action: 'incoming',
-                    data: {
-                      callerId: userId,
-                      callId: callId,
-                      callType: msg.callType,
-                      signal: msg.signal,
-                      callerName: msg.callerName
-                    },
-                    timestamp: Date.now()
-                  }));
-                }
-              });
-            } else if (msg.action === 'answer') {
-              const callerWs = self.participants.get(msg.targetId);
-              if (callerWs && callerWs.readyState === WebSocket.OPEN) {
-                callerWs.send(JSON.stringify({
-                  type: 'call',
-                  action: 'answered',
-                  data: {
-                    answererId: userId,
-                    signal: msg.signal
-                  },
-                  timestamp: Date.now()
+          case 'call-reject':
+          case 'call-end':
+            this.callState = 'idle';
+            // Notify all participants
+            for (const [id, ws] of this.participants) {
+              if (id !== userId && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: msg.type === 'call-reject' ? 'call-rejected' : 'call-ended',
+                  senderId: userId,
                 }));
               }
-            } else if (msg.action === 'reject' || msg.action === 'end') {
-              self.participants.forEach(function(ws, id) {
-                if (id !== userId && ws.readyState === WebSocket.OPEN) {
-                  ws.send(JSON.stringify({
-                    type: 'call',
-                    action: msg.action === 'reject' ? 'rejected' : 'ended',
-                    senderId: userId,
-                    timestamp: Date.now()
-                  }));
-                }
-              });
             }
             break;
         }
@@ -310,24 +260,23 @@ export class CallRoom extends DurableObject {
       }
     });
     
-    server.addEventListener('close', function() {
-      self.participants.delete(userId);
+    server.addEventListener('close', () => {
+      this.participants.delete(userId);
       
-      self.participants.forEach(function(ws, id) {
+      // Notify others that participant left
+      for (const [id, ws] of this.participants) {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
-            type: 'call',
-            action: 'participant-left',
+            type: 'call-ended',
             senderId: userId,
-            timestamp: Date.now()
           }));
         }
-      });
+      }
     });
     
     return new Response(null, {
       status: 101,
-      webSocket: client
+      webSocket: client,
     });
   }
 }
