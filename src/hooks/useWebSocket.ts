@@ -4,10 +4,16 @@ import { useEffect, useRef, useCallback, useState } from 'react';
 import { useAuthStore } from '@/store/auth';
 import { useChatStore } from '@/store/chat';
 
-// Global WebSocket instance
+// Global WebSocket instance to prevent duplicate connections
 let globalWs: WebSocket | null = null;
 let globalUserId: string | null = null;
+let reconnectAttempts = 0;
 let reconnectTimeout: NodeJS.Timeout | null = null;
+let heartbeatInterval: NodeJS.Timeout | null = null;
+let messageQueue: any[] = []; // Queue for messages during reconnect
+
+const MAX_RECONNECT_ATTEMPTS = 10;
+const HEARTBEAT_INTERVAL = 25000; // 25 seconds
 
 // Cloudflare Workers URL - must use wss:// for secure WebSocket
 const getWebSocketUrl = (userId: string) => {
@@ -22,12 +28,25 @@ export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const lastPongRef = useRef<number>(Date.now());
 
   // Handle incoming messages - defined first to avoid hoisting issues
   const handleMessage = useCallback((msg: any) => {
     const { type, action, data, senderId } = msg;
     
     console.log('[WebSocket] 📨 Received:', type, action, { data, senderId });
+
+    // Handle pong - update last pong time
+    if (type === 'pong') {
+      lastPongRef.current = Date.now();
+      return;
+    }
+
+    // Handle connection confirmation
+    if (type === 'connected') {
+      console.log('[WebSocket] ✅ Connection confirmed for user:', msg.userId);
+      return;
+    }
 
     switch (type) {
       case 'message':
@@ -73,7 +92,7 @@ export function useWebSocket() {
         break;
 
       case 'typing':
-        useChatStore.getState().setTypingUser(senderId, '', data?.isTyping ?? true);
+        useChatStore.getState().setTypingUser(senderId || '', '', data?.isTyping ?? true);
         break;
 
       case 'presence':
@@ -127,8 +146,42 @@ export function useWebSocket() {
     }
   }, []);
 
-  // Initialize WebSocket connection
-  useEffect(() => {
+  // Start heartbeat mechanism
+  const startHeartbeat = useCallback(() => {
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+    }
+    
+    heartbeatInterval = setInterval(() => {
+      if (globalWs?.readyState === WebSocket.OPEN) {
+        // Check if we received a pong recently
+        const timeSinceLastPong = Date.now() - lastPongRef.current;
+        if (timeSinceLastPong > 60000) {
+          console.log('[WebSocket] No pong received for 60s, reconnecting...');
+          globalWs.close(1000, 'Heartbeat timeout');
+          return;
+        }
+        
+        // Send ping
+        globalWs.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
+        console.log('[WebSocket] 🏓 Ping sent');
+      }
+    }, HEARTBEAT_INTERVAL);
+  }, []);
+
+  // Process queued messages
+  const processMessageQueue = useCallback(() => {
+    if (messageQueue.length > 0 && globalWs?.readyState === WebSocket.OPEN) {
+      console.log('[WebSocket] Processing', messageQueue.length, 'queued messages');
+      while (messageQueue.length > 0) {
+        const msg = messageQueue.shift();
+        globalWs.send(JSON.stringify(msg));
+      }
+    }
+  }, []);
+
+  // Connect WebSocket
+  const connect = useCallback(() => {
     const userId = user?.id;
     
     if (!userId) {
@@ -136,6 +189,10 @@ export function useWebSocket() {
         globalWs.close();
         globalWs = null;
         globalUserId = null;
+      }
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
       }
       return;
     }
@@ -173,25 +230,43 @@ export function useWebSocket() {
       console.log('[WebSocket] ✅ Connected');
       setIsConnected(true);
       setConnectionError(null);
+      reconnectAttempts = 0;
+      lastPongRef.current = Date.now();
+      
+      // Start heartbeat
+      startHeartbeat();
+      
+      // Process any queued messages
+      processMessageQueue();
     };
 
     ws.onclose = (event) => {
-      console.log('[WebSocket] Disconnected:', event.reason);
+      console.log('[WebSocket] Disconnected:', event.code, event.reason);
       setIsConnected(false);
       
-      // Attempt reconnect after 3 seconds
-      if (globalUserId === userId) {
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
+      
+      // Attempt reconnect with exponential backoff
+      if (globalUserId === userId && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+        const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+        reconnectAttempts++;
+        
+        console.log(`[WebSocket] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
+        
         reconnectTimeout = setTimeout(() => {
-          console.log('[WebSocket] Attempting reconnect...');
-          // Trigger reconnect by resetting
-          globalWs = null;
-          globalUserId = null;
-        }, 3000);
+          connect();
+        }, delay);
+      } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.error('[WebSocket] Max reconnect attempts reached');
+        setConnectionError('Connection lost. Please refresh the page.');
       }
     };
 
-    ws.onerror = () => {
-      console.error('[WebSocket] Connection error');
+    ws.onerror = (error) => {
+      console.error('[WebSocket] Connection error:', error);
       queueMicrotask(() => setConnectionError('Connection error'));
     };
 
@@ -203,14 +278,23 @@ export function useWebSocket() {
         console.error('[WebSocket] Parse error:', e);
       }
     };
+  }, [user?.id, handleMessage, startHeartbeat, processMessageQueue]);
 
+  // Initialize WebSocket connection
+  useEffect(() => {
+    connect();
+    
     return () => {
       if (reconnectTimeout) {
         clearTimeout(reconnectTimeout);
         reconnectTimeout = null;
       }
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
     };
-  }, [user?.id, handleMessage]);
+  }, [connect]);
 
   // Request notification permission
   useEffect(() => {
@@ -221,61 +305,71 @@ export function useWebSocket() {
 
   // ==================== SEND FUNCTIONS ====================
 
-  const sendMessage = useCallback((receiverId: string | undefined, channelId: string | undefined, message: any) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'message',
-        action: 'send',
-        receiverId,
-        channelId,
-        data: message
-      }));
+  // Safe send - queues message if not connected
+  const safeSend = useCallback((msg: any) => {
+    if (globalWs?.readyState === WebSocket.OPEN) {
+      globalWs.send(JSON.stringify(msg));
+      return true;
     } else {
-      console.warn('[WebSocket] Cannot send message - not connected');
+      console.log('[WebSocket] Not connected, queuing message');
+      messageQueue.push(msg);
+      return false;
     }
   }, []);
+
+  const sendMessage = useCallback((receiverId: string | undefined, channelId: string | undefined, message: any) => {
+    safeSend({
+      type: 'message',
+      action: 'send',
+      receiverId,
+      channelId,
+      targetId: receiverId,
+      data: message,
+      messageId: message.id,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   const sendTyping = useCallback((targetId: string, isTyping: boolean) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'typing',
-        targetId,
-        isTyping
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'typing',
+      action: isTyping ? 'start' : 'stop',
+      targetId,
+      isTyping,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   const markAsRead = useCallback((targetId: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'read',
-        targetId
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'read',
+      action: 'mark',
+      targetId,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   const notifyContactAdded = useCallback((contactId: string, contact: any) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'contact',
-        action: 'added',
-        contactId,
-        data: contact
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'contact',
+      action: 'added',
+      contactId,
+      data: contact,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   // ==================== CALL FUNCTIONS ====================
   // Calls use separate CallRoom Durable Object for better reliability
 
   const callUser = useCallback(async (targetId: string, signal: any, callType: 'voice' | 'video', callerName: string) => {
     // Check connection first
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+    if (!globalWs || globalWs.readyState !== WebSocket.OPEN) {
       // Try to wait for connection
       console.log('[WebSocket] Waiting for connection before call...');
       await new Promise<void>((resolve) => {
         const checkInterval = setInterval(() => {
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
+          if (globalWs?.readyState === WebSocket.OPEN) {
             clearInterval(checkInterval);
             resolve();
           }
@@ -289,7 +383,7 @@ export function useWebSocket() {
     }
 
     // Check again after waiting
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+    if (!globalWs || globalWs.readyState !== WebSocket.OPEN) {
       window.dispatchEvent(new CustomEvent('void-call-error', {
         detail: { message: 'Нет соединения с сервером. Проверьте интернет.' }
       }));
@@ -298,108 +392,101 @@ export function useWebSocket() {
     
     const callId = `call-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     
-    wsRef.current.send(JSON.stringify({
+    globalWs.send(JSON.stringify({
       type: 'call',
       action: 'start',
       targetId,
       callType,
       signal,
       callerName,
-      callId
+      callId,
+      timestamp: Date.now()
     }));
   }, []);
 
   const answerCall = useCallback((targetId: string, signal: any, callId?: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'call',
-        action: 'answer',
-        targetId,
-        signal,
-        callId
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'call',
+      action: 'answer',
+      targetId,
+      signal,
+      callId,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   const rejectCall = useCallback((targetId: string, callId?: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'call',
-        action: 'reject',
-        targetId,
-        callId
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'call',
+      action: 'reject',
+      targetId,
+      callId,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   const endCall = useCallback((targetId: string, callId?: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'call',
-        action: 'end',
-        targetId,
-        callId
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'call',
+      action: 'end',
+      targetId,
+      callId,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   const sendIceCandidate = useCallback((targetId: string, candidate: any) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'call',
-        action: 'ice-candidate',
-        targetId,
-        candidate
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'call',
+      action: 'ice-candidate',
+      targetId,
+      candidate,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   // ==================== SCREEN/COLLABORATION ====================
 
   const notifyScreenShareStart = useCallback((targetId: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'screen',
-        action: 'start',
-        targetId
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'screen',
+      action: 'start',
+      targetId,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   const notifyScreenShareStop = useCallback((targetId: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'screen',
-        action: 'stop',
-        targetId
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'screen',
+      action: 'stop',
+      targetId,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   const sendCanvasDraw = useCallback((targetId: string, from: { x: number; y: number }, to: { x: number; y: number }, color: string, size: number) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'canvas',
-        action: 'draw',
-        targetId,
-        from,
-        to,
-        color,
-        size
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'canvas',
+      action: 'draw',
+      targetId,
+      from,
+      to,
+      color,
+      size,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   const sendDocumentUpdate = useCallback((targetId: string, text: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'document',
-        action: 'update',
-        targetId,
-        text
-      }));
-    }
-  }, []);
+    safeSend({
+      type: 'document',
+      action: 'update',
+      targetId,
+      text,
+      timestamp: Date.now()
+    });
+  }, [safeSend]);
 
   return {
     sendMessage,
@@ -415,8 +502,8 @@ export function useWebSocket() {
     notifyScreenShareStop,
     sendCanvasDraw,
     sendDocumentUpdate,
-    isConnected: () => wsRef.current?.readyState === WebSocket.OPEN,
+    isConnected: () => globalWs?.readyState === WebSocket.OPEN,
     connectionError,
+    reconnectAttempts,
   };
 }
-// Build trigger: Tue Feb 17 15:51:51 UTC 2026

@@ -5,15 +5,21 @@ interface WebSocketWithMetadata {
   websocket: WebSocket;
   userId: string;
   joinedAt: number;
+  lastActivity: number;
 }
 
 interface ChatMessage {
-  type: 'message' | 'typing' | 'read' | 'presence' | 'contact' | 'call' | 'ping';
+  type: 'message' | 'typing' | 'read' | 'presence' | 'contact' | 'call' | 'ping' | 'pong' | 'ack';
   action: string;
   data: any;
   senderId?: string;
+  targetId?: string;
+  messageId?: string;
   timestamp?: number;
 }
+
+// Connection timeout - close if no activity for this long
+const CONNECTION_TIMEOUT = 120000; // 2 minutes
 
 // ChatRoom Durable Object - handles WebSocket connections for a specific room
 export class ChatRoom extends DurableObject {
@@ -22,9 +28,35 @@ export class ChatRoom extends DurableObject {
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
+    // Set up WebSocket hibernation support
+    state.setWebSocketAutoResponseThreshold(30000); // Auto-respond to pings
+  }
+
+  // Clean up stale connections - called on each request
+  private cleanupStaleConnections(): void {
+    const now = Date.now();
+    const staleThreshold = now - CONNECTION_TIMEOUT;
+    
+    for (const [ws, meta] of this.sessions) {
+      // Check if connection is stale or closed
+      if (ws.readyState !== WebSocket.OPEN || meta.lastActivity < staleThreshold) {
+        console.log('[ChatRoom] Cleaning up stale connection for user:', meta.userId);
+        try {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.close(1000, 'Connection timeout');
+          }
+        } catch (e) {
+          // Ignore close errors
+        }
+        this.sessions.delete(ws);
+      }
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
+    // Clean up stale connections on each request
+    this.cleanupStaleConnections();
+    
     const url = new URL(request.url);
     
     // Handle WebSocket upgrade
@@ -50,6 +82,20 @@ export class ChatRoom extends DurableObject {
         headers: { 'Content-Type': 'application/json', ...corsHeaders() },
       });
     }
+
+    // Health check endpoint
+    if (url.pathname === '/health') {
+      return new Response(JSON.stringify({
+        status: 'ok',
+        connections: this.sessions.size,
+        users: Array.from(this.sessions.values()).map(s => ({
+          userId: s.userId,
+          lastActivity: s.lastActivity
+        }))
+      }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+      });
+    }
     
     return new Response('Not Found', { status: 404 });
   }
@@ -71,10 +117,18 @@ export class ChatRoom extends DurableObject {
       websocket: server,
       userId,
       joinedAt: Date.now(),
+      lastActivity: Date.now(),
     };
     
     this.sessions.set(server, metadata);
     this.lastActivity = Date.now();
+
+    // Send connection confirmation
+    server.send(JSON.stringify({
+      type: 'connected',
+      userId,
+      timestamp: Date.now()
+    }));
     
     // Notify others that user joined
     await this.broadcast({
@@ -89,6 +143,12 @@ export class ChatRoom extends DurableObject {
         const msg = JSON.parse(event.data as string) as ChatMessage;
         msg.senderId = userId;
         msg.timestamp = Date.now();
+        
+        // Update last activity
+        const meta = this.sessions.get(server);
+        if (meta) {
+          meta.lastActivity = Date.now();
+        }
         
         await this.handleMessage(server, msg);
       } catch (e) {
@@ -124,16 +184,21 @@ export class ChatRoom extends DurableObject {
     
     switch (msg.type) {
       case 'message':
-        // Don't broadcast 'send' action - it's handled by API
-        // Only broadcast if it's already a 'new' message from API
-        if (msg.action === 'new') {
-          await this.broadcast(msg, sender);
+        // Handle both 'send' and 'new' actions
+        if (msg.action === 'send' || msg.action === 'new') {
+          // Convert 'send' to 'new' for consistency
+          const broadcastMsg = {
+            ...msg,
+            action: 'new'
+          };
+          
+          // Broadcast to all connected clients in this room
+          await this.broadcast(broadcastMsg, sender);
         }
-        // Ignore 'send' action - messages are sent via REST API
         break;
         
       case 'typing':
-        // Broadcast typing indicator
+        // Broadcast typing indicator to others in the room
         await this.broadcast(msg, sender);
         break;
         
@@ -153,8 +218,16 @@ export class ChatRoom extends DurableObject {
         break;
         
       case 'ping':
-        // Respond with pong
-        sender.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+        // Respond with pong immediately
+        sender.send(JSON.stringify({ 
+          type: 'pong', 
+          timestamp: Date.now() 
+        }));
+        break;
+
+      case 'ack':
+        // Acknowledgment from client - message received
+        console.log('[ChatRoom] ACK received for message:', msg.messageId);
         break;
         
       default:
@@ -164,27 +237,74 @@ export class ChatRoom extends DurableObject {
 
   async broadcast(message: ChatMessage, exclude?: WebSocket): Promise<void> {
     const messageStr = JSON.stringify(message);
+    let sentCount = 0;
+    const deadSockets: WebSocket[] = [];
     
-    for (const [ws] of this.sessions) {
-      if (ws !== exclude && ws.readyState === WebSocket.OPEN) {
-        ws.send(messageStr);
+    for (const [ws, meta] of this.sessions) {
+      if (ws !== exclude) {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(messageStr);
+            sentCount++;
+          } catch (e) {
+            console.error('[ChatRoom] Failed to send to user:', meta.userId, e);
+            deadSockets.push(ws);
+          }
+        } else {
+          deadSockets.push(ws);
+        }
       }
     }
+    
+    // Clean up dead sockets
+    for (const ws of deadSockets) {
+      this.sessions.delete(ws);
+    }
+    
+    console.log('[ChatRoom] Broadcast', message.type, message.action, 'to', sentCount, 'clients');
   }
 }
 
 // CallRoom Durable Object - handles WebRTC signaling
 export class CallRoom extends DurableObject {
-  private participants: Map<string, WebSocket> = new Map();
+  private participants: Map<string, { ws: WebSocket; lastActivity: number }> = new Map();
   private callState: 'idle' | 'ringing' | 'connected' = 'idle';
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
+    state.setWebSocketAutoResponseThreshold(30000);
+  }
+
+  // Clean up stale participants
+  private cleanupStaleParticipants(): void {
+    const now = Date.now();
+    const staleThreshold = now - CONNECTION_TIMEOUT;
+    
+    for (const [userId, data] of this.participants) {
+      if (data.ws.readyState !== WebSocket.OPEN || data.lastActivity < staleThreshold) {
+        console.log('[CallRoom] Cleaning up stale participant:', userId);
+        this.participants.delete(userId);
+      }
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
+    this.cleanupStaleParticipants();
+    
     if (request.headers.get('Upgrade') === 'websocket') {
       return this.handleWebSocket(request);
+    }
+
+    // Health check
+    const url = new URL(request.url);
+    if (url.pathname === '/health') {
+      return new Response(JSON.stringify({
+        status: 'ok',
+        callState: this.callState,
+        participants: Array.from(this.participants.keys())
+      }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders() },
+      });
     }
     
     return new Response('Not Found', { status: 404 });
@@ -203,12 +323,27 @@ export class CallRoom extends DurableObject {
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
     
     server.accept();
-    this.participants.set(userId, server);
+    this.participants.set(userId, { ws: server, lastActivity: Date.now() });
+
+    // Send connection confirmation
+    server.send(JSON.stringify({
+      type: 'connected',
+      userId,
+      callId,
+      callState: this.callState,
+      timestamp: Date.now()
+    }));
     
     server.addEventListener('message', async (event) => {
       try {
         const msg = JSON.parse(event.data as string);
         msg.senderId = userId;
+        
+        // Update last activity
+        const participant = this.participants.get(userId);
+        if (participant) {
+          participant.lastActivity = Date.now();
+        }
         
         // Handle WebRTC signaling
         switch (msg.type) {
@@ -216,23 +351,24 @@ export class CallRoom extends DurableObject {
           case 'answer':
           case 'ice-candidate':
             // Forward to specific target
-            const targetWs = this.participants.get(msg.targetId);
-            if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-              targetWs.send(JSON.stringify(msg));
+            const targetData = this.participants.get(msg.targetId);
+            if (targetData?.ws.readyState === WebSocket.OPEN) {
+              targetData.ws.send(JSON.stringify(msg));
             }
             break;
             
           case 'call-start':
             this.callState = 'ringing';
             // Notify other participants
-            for (const [id, ws] of this.participants) {
-              if (id !== userId && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
+            for (const [id, data] of this.participants) {
+              if (id !== userId && data.ws.readyState === WebSocket.OPEN) {
+                data.ws.send(JSON.stringify({
                   type: 'incoming-call',
                   callerId: userId,
                   callId,
                   callType: msg.callType,
                   signal: msg.signal,
+                  callerName: msg.callerName,
                 }));
               }
             }
@@ -240,9 +376,9 @@ export class CallRoom extends DurableObject {
             
           case 'call-answer':
             this.callState = 'connected';
-            const callerWs = this.participants.get(msg.targetId);
-            if (callerWs && callerWs.readyState === WebSocket.OPEN) {
-              callerWs.send(JSON.stringify({
+            const callerData = this.participants.get(msg.targetId);
+            if (callerData?.ws.readyState === WebSocket.OPEN) {
+              callerData.ws.send(JSON.stringify({
                 type: 'call-answered',
                 answererId: userId,
                 signal: msg.signal,
@@ -254,14 +390,18 @@ export class CallRoom extends DurableObject {
           case 'call-end':
             this.callState = 'idle';
             // Notify all participants
-            for (const [id, ws] of this.participants) {
-              if (id !== userId && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
+            for (const [id, data] of this.participants) {
+              if (id !== userId && data.ws.readyState === WebSocket.OPEN) {
+                data.ws.send(JSON.stringify({
                   type: msg.type === 'call-reject' ? 'call-rejected' : 'call-ended',
                   senderId: userId,
                 }));
               }
             }
+            break;
+
+          case 'ping':
+            server.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
             break;
         }
       } catch (e) {
@@ -273,9 +413,9 @@ export class CallRoom extends DurableObject {
       this.participants.delete(userId);
       
       // Notify others that participant left
-      for (const [id, ws] of this.participants) {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
+      for (const [id, data] of this.participants) {
+        if (data.ws.readyState === WebSocket.OPEN) {
+          data.ws.send(JSON.stringify({
             type: 'call-ended',
             senderId: userId,
           }));

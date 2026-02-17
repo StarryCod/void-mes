@@ -1,36 +1,48 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 
-// Notify user via Cloudflare Worker WebSocket
-async function notifyUser(userId: string, message: any) {
-  try {
-    const WORKER_URL = process.env.NEXT_PUBLIC_CF_WORKERS_URL || 'https://void-time.mr-starred09.workers.dev';
+// Notify user via Cloudflare Worker WebSocket with retry
+async function notifyUser(userId: string, message: any, retries = 3): Promise<boolean> {
+  const WORKER_URL = process.env.NEXT_PUBLIC_CF_WORKERS_URL || 'https://void-time.mr-starred09.workers.dev';
+  
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(`${WORKER_URL}/ws/user/${userId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'message',
+          action: 'new',
+          data: message,
+          senderId: message.senderId,
+          messageId: message.id,
+          timestamp: Date.now()
+        })
+      });
+      
+      if (response.ok) {
+        console.log(`[API] ✅ WebSocket notification sent to ${userId} (attempt ${attempt})`);
+        return true;
+      } else {
+        console.warn(`[API] ⚠️ WebSocket notification failed for ${userId} (attempt ${attempt}): ${response.status}`);
+      }
+    } catch (error) {
+      console.error(`[API] ❌ WebSocket notification error (attempt ${attempt}):`, error);
+    }
     
-    // Get sender info
-    const sender = await db.user.findUnique({
-      where: { id: message.senderId },
-      select: { id: true, username: true, displayName: true, avatar: true }
-    });
-    
-    const fullMessage = { ...message, sender };
-    
-    // Notify via Worker's broadcast endpoint
-    await fetch(`${WORKER_URL}/ws/user/${userId}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'message',
-        action: 'new',
-        data: fullMessage,
-        senderId: message.senderId,
-        timestamp: Date.now()
-      })
-    });
-    
-    console.log('[API] WebSocket notification sent to:', userId);
-  } catch (error) {
-    console.error('[API] Failed to send WebSocket notification:', error);
+    // Wait before retry
+    if (attempt < retries) {
+      await new Promise(resolve => setTimeout(resolve, 500 * attempt));
+    }
   }
+  
+  return false;
+}
+
+// Notify multiple users in parallel
+async function notifyUsers(userIds: string[], message: any): Promise<void> {
+  const notifications = userIds.map(userId => notifyUser(userId, message));
+  await Promise.allSettled(notifications);
 }
 
 export async function GET(request: NextRequest) {
@@ -156,7 +168,13 @@ export async function POST(request: NextRequest) {
       }
     });
 
-    // Prepare message for response
+    // Get sender info for notification
+    const sender = await db.user.findUnique({
+      where: { id: userId },
+      select: { id: true, username: true, displayName: true, avatar: true }
+    });
+
+    // Prepare message for response and notification
     const messageResponse = {
       id: message.id,
       content: message.content,
@@ -170,9 +188,10 @@ export async function POST(request: NextRequest) {
       voiceDuration: message.voiceDuration,
       voiceUrl: message.voiceUrl,
       attachments: message.attachments || [],
+      sender: sender,
     };
 
-    // Notify receiver via WebSocket (non-blocking)
+    // Notify via WebSocket (non-blocking but tracked)
     if (receiverId) {
       // Direct message - notify receiver
       notifyUser(receiverId, messageResponse).catch(console.error);
@@ -182,11 +201,10 @@ export async function POST(request: NextRequest) {
         where: { channelId },
         select: { userId: true }
       }).then(members => {
-        members.forEach(member => {
-          if (member.userId !== userId) {
-            notifyUser(member.userId, { ...messageResponse, channelId }).catch(console.error);
-          }
-        });
+        const userIds = members
+          .filter(m => m.userId !== userId)
+          .map(m => m.userId);
+        notifyUsers(userIds, messageResponse).catch(console.error);
       }).catch(console.error);
     }
 

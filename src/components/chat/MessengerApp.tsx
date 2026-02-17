@@ -486,8 +486,7 @@ export function MessengerApp() {
         const current = useChatStore.getState().messages || [];
         setMessages([...current.filter((m: Message) => m.id !== tempId), data.message]);
         
-        // Send via socket for real-time delivery
-        wsSendMessage(activeChat?.id, activeChannel?.id, data.message);
+        // WebSocket notification is handled by API route - no need to send again
       }
     } catch (e) {
       console.error('Send error:', e);
@@ -600,8 +599,7 @@ export function MessengerApp() {
           voiceUrlsRef.current.set(data.message.id, uploaded.url);
           addMessage(data.message);
           
-          // Send via socket for real-time delivery
-          wsSendMessage(activeChat?.id, activeChannel?.id, data.message);
+          // WebSocket notification is handled by API route - no need to send again
         }
       } catch (e) {
         console.error('Voice send error:', e);
