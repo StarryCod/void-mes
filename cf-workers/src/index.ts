@@ -121,6 +121,8 @@ app.post('/api/contacts', async (c) => {
         id: userId,
         ...contactInfo[0],
       },
+      senderId: userId,
+      timestamp: Date.now(),
     }),
   }));
   
@@ -215,6 +217,8 @@ app.post('/api/messages', async (c) => {
         type: 'message',
         action: 'new',
         data: fullMessage,
+        senderId: userId,
+        timestamp: Date.now(),
       }),
     }));
   } else if (channelId) {
@@ -227,6 +231,8 @@ app.post('/api/messages', async (c) => {
         type: 'message',
         action: 'new',
         data: fullMessage,
+        senderId: userId,
+        timestamp: Date.now(),
       }),
     }));
   }
@@ -319,17 +325,30 @@ app.get('/ws/user/:userId', async (c) => {
   const userId = c.req.param('userId');
   const roomId = `user-${userId}`;
   
+  // Add userId to query params for Durable Object
+  const url = new URL(c.req.url);
+  url.searchParams.set('userId', userId);
+  const modifiedRequest = new Request(url.toString(), c.req.raw);
+  
   const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-  return room.fetch(c.req.raw);
+  return room.fetch(modifiedRequest);
 });
 
 // WebSocket endpoint for channel events
 app.get('/ws/channel/:channelId', async (c) => {
   const channelId = c.req.param('channelId');
+  const userId = c.req.query('userId');
   const roomId = `channel-${channelId}`;
   
+  // Add userId to query params for Durable Object
+  const url = new URL(c.req.url);
+  if (userId) {
+    url.searchParams.set('userId', userId);
+  }
+  const modifiedRequest = new Request(url.toString(), c.req.raw);
+  
   const room = c.env.CHAT_ROOM.get(c.env.CHAT_ROOM.idFromName(roomId));
-  return room.fetch(c.req.raw);
+  return room.fetch(modifiedRequest);
 });
 
 // WebSocket endpoint for calls
@@ -354,7 +373,7 @@ app.get('/', (c) => {
   return c.json({ 
     status: 'ok', 
     service: 'void-realtime',
-    version: '1.0.0',
+    version: '2.0.0',
     endpoints: {
       websocket: {
         user: '/ws/user/:userId',
