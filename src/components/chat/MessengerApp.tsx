@@ -9,7 +9,6 @@ import { AuthForm } from '@/components/auth/AuthForm';
 import { VoidLogo } from '@/components/common/VoidLogo';
 import { CallManager } from '@/components/call/CallManager';
 import { useWebSocket } from '@/hooks/useWebSocket';
-import { useAppwriteRealtime } from '@/hooks/useAppwriteRealtime';
 import { useToast } from '@/hooks/use-toast';
 import {
   Plus, MessageSquare, Hash, X, Check, LogOut, Settings,
@@ -236,34 +235,14 @@ export function MessengerApp() {
     if (activeTarget && token) fetchMessages(true);
   }, [activeTarget?.id, token]);
 
-  // Appwrite Realtime - fetch messages when event received
-  const handleRealtimeMessage = useCallback(async (messageId: string) => {
-    if (!token || !activeTarget) return;
-    try {
-      const endpoint = isChannel 
-        ? `/api/messages?channelId=${activeTarget.id}`
-        : `/api/messages?contactId=${activeTarget.id}`;
-      const res = await fetch(endpoint, { headers: { Authorization: `Bearer ${token}` } });
-      const data = await res.json();
-      const allMessages = Array.isArray(data?.messages) ? data.messages : [];
-      const newMsg = allMessages.find((m: Message) => m.id === messageId);
-      if (newMsg) {
-        const currentMessages = useChatStore.getState().messages || [];
-        if (!currentMessages.find((m: Message) => m.id === messageId)) {
-          setMessages([...currentMessages, newMsg]);
-        }
-      }
-    } catch (e) {
-      console.error('Realtime fetch error:', e);
-    }
-  }, [token, activeTarget?.id, isChannel]);
-
-  useAppwriteRealtime(
-    user?.id || null,
-    activeChat?.id || null,
-    activeChannel?.id || null,
-    handleRealtimeMessage
-  );
+  // NOTE: Appwrite Realtime disabled - using Worker WebSocket instead
+  // The WebSocket notifications are handled by useWebSocket hook
+  // useAppwriteRealtime(
+  //   user?.id || null,
+  //   activeChat?.id || null,
+  //   activeChannel?.id || null,
+  //   handleRealtimeMessage
+  // );
 
   useEffect(() => {
     if (scrollRef.current) {
