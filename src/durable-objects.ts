@@ -8,7 +8,7 @@ interface WebSocketWithMetadata {
 }
 
 interface ChatMessage {
-  type: 'message' | 'typing' | 'read' | 'presence' | 'contact' | 'call';
+  type: 'message' | 'typing' | 'read' | 'presence' | 'contact' | 'call' | 'ping';
   action: string;
   data: any;
   senderId?: string;
@@ -124,8 +124,12 @@ export class ChatRoom extends DurableObject {
     
     switch (msg.type) {
       case 'message':
-        // Broadcast message to all in room
-        await this.broadcast(msg);
+        // Don't broadcast 'send' action - it's handled by API
+        // Only broadcast if it's already a 'new' message from API
+        if (msg.action === 'new') {
+          await this.broadcast(msg, sender);
+        }
+        // Ignore 'send' action - messages are sent via REST API
         break;
         
       case 'typing':
@@ -146,6 +150,11 @@ export class ChatRoom extends DurableObject {
       case 'call':
         // Call signaling
         await this.broadcast(msg, sender);
+        break;
+        
+      case 'ping':
+        // Respond with pong
+        sender.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
         break;
         
       default:
